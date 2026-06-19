@@ -1,0 +1,21 @@
+# Build output
+bin/
+obj/
+
+# Visual Studio / Rider
+.vs/
+.idea/
+*.user
+*.suo
+
+# Published output
+publish/
+
+# === Runtime artifacts and SECRETS — never commit these ===
+credentials.json
+diagnostics/
+*.bak
+*.bak-*
+
+# Misc
+*.log
