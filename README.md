@@ -2,38 +2,38 @@
 
 A Windows desktop bot that automates lessons on [lingos.pl](https://lingos.pl) using Selenium and Google Chrome. It logs in, learns your vocabulary from your *Zestawy*, and auto-completes lessons. Before each lesson it automatically picks or continues a **Wyzwania** (challenge), preferring the one worth the most points.
 
-## Download & run (no compiler needed)
+This repository contains the **source code** — you build the program yourself with one command (see below).
 
-1. Download `LingosBot.exe` from the [Releases](../../releases) page.
-2. Make sure **Google Chrome** is installed.
-3. Run it from a terminal so you can watch the output:
-   ```powershell
-   .\LingosBot.exe
-   ```
-4. On the first run it asks for your lingos.pl email & password (stored encrypted on your own PC).
-5. Choose how many lessons to run.
+## Run it (build from source)
 
-The exe is **self-contained** — it bundles the .NET runtime, so you do **not** need .NET, a compiler, or anything else installed. Google Chrome is the only requirement.
+You need the **.NET 10 SDK** and **Google Chrome** installed.
+
+```
+# 1. get the code
+git clone https://github.com/yuriiamelnychuk-lgtm/Lingos.git
+cd Lingos
+
+# 2a. run it directly
+dotnet run --project LingosBot
+
+# 2b. ...or build a standalone .exe you can double-click
+dotnet publish LingosBot -c Release -r win-x64 -p:PublishSingleFile=true --self-contained true
+```
+
+The published `.exe` is **self-contained** — it bundles the .NET runtime, so once built it needs nothing but **Google Chrome** to run. (You only need the .NET SDK to *build* it, not to run it.)
+
+## First run
+
+1. It asks for your lingos.pl email & password (stored **encrypted** on your own PC).
+2. You choose how many lessons to run.
 
 ## Menu
 
-- `[number]` — run that many lessons (each one auto-picks/continues a challenge)
+- `[number]` — run that many lessons (each one auto-picks/continues the highest-point challenge)
 - `[R]` — change your saved email / password (with a "back" option)
 - `[Q]` — quit
 
 Chrome runs **headless** (no window) and **muted**, and each word is streamed to the terminal as it's answered.
-
-## Build from source (optional)
-
-Requires the **.NET 10 SDK**.
-
-```powershell
-# run directly
-dotnet run --project LingosBot
-
-# or produce the standalone exe
-dotnet publish LingosBot -c Release -r win-x64 -p:PublishSingleFile=true --self-contained true
-```
 
 ## Notes
 
