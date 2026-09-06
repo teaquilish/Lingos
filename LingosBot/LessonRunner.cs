@@ -1,22 +1,53 @@
+using System.Globalization;
 using OpenQA.Selenium;
-using OpenQA.Selenium.Support.UI;
 
 namespace LingosBotApp;
 
+/// <summary>
+/// Runs one lesson at a time: open the dashboard, start a lesson, then answer each prompt from
+/// the collected vocabulary. Prompts are answered through the site's own answer endpoint, with
+/// a fallback that types into the page when that endpoint cannot be used.
+/// </summary>
 internal sealed class LessonRunner
 {
-    private readonly IWebDriver _driver;
+    private const string StateExercise = "exercise";
+    private const string StateFinished = "finished";
+    private const string StateChangeWordset = "change_wordset";
+    private const string StateSelectLevel = "select_level";
+    private const string TypeFlashcard = "flashcard";
+    private const string StatusOk = "ok";
+    private const string ReasonLimitExceeded = "limit-exceeded";
+
+    private const string PopulateAnswerScript = """
+        const input = arguments[0];
+        const value = arguments[1];
+        const descriptor =
+            Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input), 'value') ||
+            Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+        if (!descriptor || typeof descriptor.set !== 'function') { return false; }
+        input.focus();
+        descriptor.set.call(input, '');
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        descriptor.set.call(input, value);
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+        """;
+
+    private readonly PageAgent _page;
     private readonly AppConfig _config;
     private readonly IReadOnlyDictionary<string, IReadOnlyList<string>> _vocabulary;
     private readonly IReadOnlyDictionary<string, IReadOnlyList<string>> _reverseVocabulary;
 
-    public LessonRunner(
-        IWebDriver driver,
-        AppConfig config,
-        IReadOnlyDictionary<string, IReadOnlyList<string>> vocabulary)
+    public LessonRunner(IWebDriver driver, AppConfig config, IReadOnlyDictionary<string, IReadOnlyList<string>> vocabulary)
+        : this(new PageAgent(driver, config), vocabulary)
     {
-        _driver = driver;
-        _config = config;
+    }
+
+    public LessonRunner(PageAgent page, IReadOnlyDictionary<string, IReadOnlyList<string>> vocabulary)
+    {
+        _page = page;
+        _config = page.Config;
         _vocabulary = vocabulary;
         _reverseVocabulary = BuildReverseVocabulary(vocabulary);
     }
@@ -25,50 +56,306 @@ internal sealed class LessonRunner
     {
         Console.WriteLine($"Preparing lesson {lessonNumber}...");
         OpenMainPage();
-        StartLesson();
 
-        var answeredPrompts = 0;
+        var props = StartLesson();
+        if (!RunLessonViaAnswerEndpoint(lessonNumber, props))
+        {
+            Console.WriteLine("Falling back to driving the lesson through the page itself.");
+            RunLessonInPage(lessonNumber);
+        }
+    }
 
-        while (answeredPrompts < _config.LessonPromptSafetyCap)
+    // ---- getting into a lesson --------------------------------------------
+
+    private void OpenMainPage()
+    {
+        var inLesson = _page.UrlContains("/learning/");
+        if (!inLesson
+            && (_page.TryFindVisible(Selectors.MainLearnButton, out var reusable) && reusable is { Enabled: true }
+                || _page.TryWaitUntilClickable(Selectors.MainLearnButton, _config.LessonRestartReuseTimeout, out reusable) && reusable is not null))
+        {
+            return;
+        }
+
+        _page.GoTo(_config.StudentDashboardUrl);
+        _page.WaitForDocumentReady();
+        ThrowIfDailyLimitReached();
+        _page.WaitUntilClickable(Selectors.MainLearnButton);
+    }
+
+    /// <summary>
+    /// Once the daily limit is spent the dashboard simply drops the "Ucz sie" link, so check the
+    /// page data for the flag first and stop cleanly instead of waiting for a button that is gone.
+    /// </summary>
+    private void ThrowIfDailyLimitReached()
+    {
+        var props = _page.ReadProps<StudentProps>();
+        if (props?.Dashboard?.LessonLimitReached == true || props?.Wordsets?.LessonLimitReached == true)
+        {
+            throw new LessonLimitReachedException(
+                "Lingos reported that today's lesson limit has been reached for this account. The bot stopped cleanly.");
+        }
+    }
+
+    private LearningProps StartLesson()
+    {
+        Console.WriteLine("Starting a lesson from the main page...");
+        for (var attempt = 1; attempt <= 3; attempt++)
+        {
+            try
+            {
+                _page.Click(_page.WaitUntilClickable(Selectors.MainLearnButton));
+                _page.WaitForUrlContains("/learning/", _config.ShortWaitTimeout);
+
+                var props = ReadLearningProps();
+                ThrowIfLessonBlocked(props);
+                if (string.Equals(props.Status, StatusOk, StringComparison.Ordinal) && props.Step is not null)
+                {
+                    return props;
+                }
+            }
+            catch (WebDriverTimeoutException) when (attempt < 3)
+            {
+            }
+
+            Console.WriteLine("Lingos did not open a lesson on that click. Retrying...");
+            _page.GoTo(_config.StudentDashboardUrl);
+            _page.WaitForDocumentReady();
+            ThrowIfDailyLimitReached();
+        }
+
+        throw new WebDriverTimeoutException(
+            "Timed out while entering the lesson. Lingos did not show a prompt, continue step, or lesson-limit message.");
+    }
+
+    private LearningProps ReadLearningProps() => _page.ReadPropsWhenReady<LearningProps>("the lesson");
+
+    private static void ThrowIfLessonBlocked(LearningProps props)
+    {
+        if (string.Equals(props.Status, StatusOk, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        if (string.Equals(props.Reason, ReasonLimitExceeded, StringComparison.Ordinal))
+        {
+            throw new LessonLimitReachedException(
+                "Lingos reported that today's lesson limit has been reached for this account. The bot stopped cleanly.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(props.Reason))
+        {
+            throw new InvalidOperationException($"Lingos refused to start a lesson ({props.Reason}).");
+        }
+    }
+
+    // ---- fast path: the site's own answer endpoint ------------------------
+
+    /// <summary>
+    /// Plays the lesson through <c>POST /learning/answer/{lessonId}</c>, which is what the page's
+    /// own script does. Returns false if the lesson has to be finished through the page instead.
+    /// </summary>
+    private bool RunLessonViaAnswerEndpoint(int lessonNumber, LearningProps props)
+    {
+        if (!string.Equals(props.Status, StatusOk, StringComparison.Ordinal) || props.Step is null)
+        {
+            return false;
+        }
+
+        var answerUrl = AnswerUrl(props.LessonId);
+        var step = props.Step;
+
+        var attempts = 0;
+        var currentIdentifier = 0L;
+        var candidateIndex = 0;
+
+        while (attempts < _config.LessonPromptSafetyCap)
+        {
+            switch (step.State)
+            {
+                case StateFinished:
+                    Console.WriteLine($"Lesson {lessonNumber} completed after {attempts} prompts.");
+                    return true;
+
+                case StateChangeWordset:
+                {
+                    if (string.IsNullOrWhiteSpace(step.ContinueUrl))
+                    {
+                        return false;
+                    }
+
+                    Console.WriteLine("Lingos asked to carry the lesson on into the next wordset. Continuing...");
+                    _page.GoTo(ToAbsoluteUrl(step.ContinueUrl));
+
+                    var continued = ReadLearningProps();
+                    ThrowIfLessonBlocked(continued);
+                    if (!string.Equals(continued.Status, StatusOk, StringComparison.Ordinal) || continued.Step is null)
+                    {
+                        return false;
+                    }
+
+                    answerUrl = AnswerUrl(continued.LessonId);
+                    step = continued.Step;
+                    continue;
+                }
+
+                case StateSelectLevel:
+                    throw new InvalidOperationException(
+                        "Lingos wants you to choose your language level before it will start a lesson. "
+                        + "Pick it once yourself on lingos.pl, then run the bot again.");
+
+                case StateExercise:
+                    break;
+
+                default:
+                    Console.WriteLine($"Lingos returned an unfamiliar lesson step ('{step.State}').");
+                    return false;
+            }
+
+            var exercise = step.Exercise;
+            if (exercise is null)
+            {
+                return false;
+            }
+
+            if (exercise.Identifier != currentIdentifier)
+            {
+                currentIdentifier = exercise.Identifier;
+                candidateIndex = 0;
+            }
+
+            attempts++;
+            var request = BuildAnswerRequest(exercise, lessonNumber, attempts, candidateIndex, out var promptText);
+
+            var result = _page.PostJson<LearningAnswerResult>(answerUrl, request);
+            if (result?.Step is null)
+            {
+                Console.WriteLine("The lesson answer request did not go through.");
+                return false;
+            }
+
+            if (result.Feedback is { Result: <= 0 })
+            {
+                candidateIndex++;
+                ReportRejectedAnswer(promptText, request.Answer, result.Feedback, result.Step, exercise.Identifier);
+            }
+
+            step = result.Step;
+        }
+
+        throw new InvalidOperationException(
+            $"Lesson {lessonNumber} exceeded the safety cap of {_config.LessonPromptSafetyCap} prompts. Stopping to avoid an infinite loop.");
+    }
+
+    private LearningAnswerRequest BuildAnswerRequest(
+        LearningExercise exercise,
+        int lessonNumber,
+        int promptIndex,
+        int candidateIndex,
+        out string promptText)
+    {
+        promptText = TextNormalizer.Normalize(exercise.Main);
+
+        // "new_teacher" and "new_premium" only present a word; they are acknowledged, not answered.
+        if (!string.Equals(exercise.Type, TypeFlashcard, StringComparison.Ordinal))
+        {
+            Console.WriteLine($"[Lesson {lessonNumber} · word {promptIndex}] new word: {TextNormalizer.Normalize(exercise.Translation)}");
+            return new LearningAnswerRequest { Identifier = exercise.Identifier, Answer = string.Empty, Skip = false };
+        }
+
+        if (string.IsNullOrWhiteSpace(promptText))
+        {
+            throw new InvalidOperationException("The lesson prompt text was empty. Verify the lesson prompt selector in Selectors.cs.");
+        }
+
+        var candidates = ResolveCandidateAnswers(promptText);
+        if (candidates.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"No collected translation exists for lesson prompt '{promptText}'. The bot stopped safely without guessing.");
+        }
+
+        if (candidateIndex >= candidates.Count)
+        {
+            throw new InvalidOperationException($"All {candidates.Count} stored answers were rejected for lesson prompt '{promptText}'.");
+        }
+
+        var answer = candidates[candidateIndex];
+        Console.WriteLine(candidates.Count > 1 || candidateIndex > 0
+            ? $"[Lesson {lessonNumber} · word {promptIndex}] {promptText} -> {answer}  (option {candidateIndex + 1}/{candidates.Count})"
+            : $"[Lesson {lessonNumber} · word {promptIndex}] {promptText} -> {answer}");
+
+        return new LearningAnswerRequest { Identifier = exercise.Identifier, Answer = answer, Skip = false };
+    }
+
+    private static void ReportRejectedAnswer(
+        string promptText,
+        string answer,
+        LearningFeedback feedback,
+        LearningStep nextStep,
+        long identifier)
+    {
+        if (nextStep.Exercise?.Identifier == identifier)
+        {
+            Console.WriteLine($"Answer '{answer}' was rejected for '{promptText}'. Trying the next stored translation for this exact prompt only.");
+            return;
+        }
+
+        var correct = TextNormalizer.Normalize(feedback.Correct);
+        Console.WriteLine(string.IsNullOrWhiteSpace(correct)
+            ? $"Answer '{answer}' was rejected for '{promptText}'. Lingos moved on to the next word."
+            : $"Answer '{answer}' was rejected for '{promptText}' (Lingos wanted '{correct}'). Moving on to the next word.");
+    }
+
+    private string AnswerUrl(long lessonId)
+        => string.Format(CultureInfo.InvariantCulture, _config.LearningAnswerPathFormat, lessonId);
+
+    private string ToAbsoluteUrl(string urlOrPath)
+        => Uri.TryCreate(urlOrPath, UriKind.Absolute, out var absolute)
+            ? absolute.ToString()
+            : new Uri(new Uri(_config.BaseUrl), urlOrPath).ToString();
+
+    // ---- fallback: drive the lesson through the page ----------------------
+
+    private void RunLessonInPage(int lessonNumber)
+    {
+        var prompts = 0;
+        while (prompts < _config.LessonPromptSafetyCap)
         {
             if (IsLessonFinished())
             {
-                Console.WriteLine($"Lesson {lessonNumber} completed after {answeredPrompts} prompts.");
+                Console.WriteLine($"Lesson {lessonNumber} completed after {prompts} prompts.");
                 return;
             }
 
-            var step = WaitForStepOrLessonFinished();
-            if (step.Kind == LessonStepKind.Finished)
+            var state = WaitForStepOrLessonFinished();
+            if (state.Kind == LessonStepKind.Finished)
             {
-                Console.WriteLine($"Lesson {lessonNumber} completed after {answeredPrompts} prompts.");
+                Console.WriteLine($"Lesson {lessonNumber} completed after {prompts} prompts.");
                 return;
             }
 
-            if (step.Kind == LessonStepKind.ContinueOnly)
+            if (state.Kind == LessonStepKind.ContinueOnly)
             {
                 ContinueInformationalStep();
                 continue;
             }
 
-            answeredPrompts++;
-            var promptElement = step.PromptElement!;
-            var promptText = TextNormalizer.Normalize(promptElement.Text);
-
+            prompts++;
+            var promptText = TextNormalizer.Normalize(state.PromptElement!.Text);
             if (string.IsNullOrWhiteSpace(promptText))
             {
-                throw new InvalidOperationException(
-                    "The lesson prompt text was empty. Verify the lesson prompt selector in Selectors.cs.");
+                throw new InvalidOperationException("The lesson prompt text was empty. Verify the lesson prompt selector in Selectors.cs.");
             }
 
-            var candidateAnswers = ResolveCandidateAnswers(promptText);
-            if (candidateAnswers.Count == 0)
+            var candidates = ResolveCandidateAnswers(promptText);
+            if (candidates.Count == 0)
             {
                 throw new InvalidOperationException(
                     $"No collected translation exists for lesson prompt '{promptText}'. The bot stopped safely without guessing.");
             }
 
-            var lessonFinished = TryAnswerPromptWithCandidates(promptText, candidateAnswers, lessonNumber, answeredPrompts);
-            if (lessonFinished)
+            if (TryAnswerPromptWithCandidates(promptText, candidates, lessonNumber, prompts))
             {
                 Console.WriteLine($"Lesson {lessonNumber} completed.");
                 return;
@@ -79,89 +366,20 @@ internal sealed class LessonRunner
             $"Lesson {lessonNumber} exceeded the safety cap of {_config.LessonPromptSafetyCap} prompts. Stopping to avoid an infinite loop.");
     }
 
-    private void OpenMainPage()
-    {
-        var currentUrl = _driver.Url ?? string.Empty;
-        var lessonPageVisible = currentUrl.Contains("/s/lesson/", StringComparison.OrdinalIgnoreCase);
-
-        if (!lessonPageVisible &&
-            TryFindVisible(_driver, Selectors.MainLearnButton.ToBy(), out var existingLearnButton) &&
-            existingLearnButton is not null &&
-            existingLearnButton.Enabled)
-        {
-            return;
-        }
-
-        if (!lessonPageVisible &&
-            TryWaitUntilClickable(Selectors.MainLearnButton, _config.LessonRestartReuseTimeout, out var delayedLearnButton) &&
-            delayedLearnButton is not null)
-        {
-            return;
-        }
-
-        _driver.Navigate().GoToUrl(_config.StudentDashboardUrl);
-        WaitForDocumentReady();
-        WaitUntilClickable(Selectors.MainLearnButton);
-    }
-
-    private void StartLesson()
-    {
-        Console.WriteLine("Starting a lesson from the main page...");
-        const int maxEntryClicks = 3;
-
-        for (var entryClick = 1; entryClick <= maxEntryClicks; entryClick++)
-        {
-            var mainLearnButton = WaitUntilClickable(Selectors.MainLearnButton);
-            ClickElement(mainLearnButton);
-
-            var entryState = CreateWait(_config.ShortWaitTimeout).Until(_ =>
-            {
-                var state = ReadLessonEntryState();
-                return state == LessonEntryState.Waiting ? null : state.ToString();
-            }) ?? LessonEntryState.Waiting.ToString();
-
-            if (string.Equals(entryState, LessonEntryState.Blocked.ToString(), StringComparison.Ordinal))
-            {
-                ThrowIfLessonLimitReached();
-            }
-
-            if (string.Equals(entryState, LessonEntryState.Ready.ToString(), StringComparison.Ordinal))
-            {
-                return;
-            }
-
-            if (string.Equals(entryState, LessonEntryState.ResumeRequired.ToString(), StringComparison.Ordinal))
-            {
-                Console.WriteLine("Lingos opened an intermediate 'Dokończ lekcję' page. Continuing into the actual lesson...");
-                continue;
-            }
-        }
-
-        throw new WebDriverTimeoutException(
-            "Timed out while entering the lesson. Lingos did not show a prompt, continue step, or lesson-limit message.");
-    }
-
     private bool TryAnswerPromptWithCandidates(
         string promptText,
         IReadOnlyList<string> candidateAnswers,
         int lessonNumber,
         int promptIndex)
     {
-        for (var candidateIndex = 0; candidateIndex < candidateAnswers.Count; candidateIndex++)
+        for (var i = 0; i < candidateAnswers.Count; i++)
         {
-            var answer = candidateAnswers[candidateIndex];
-            if (candidateAnswers.Count > 1 || candidateIndex > 0)
-            {
-                Console.WriteLine(
-                    $"[Lesson {lessonNumber} · word {promptIndex}] {promptText} -> {answer}  (option {candidateIndex + 1}/{candidateAnswers.Count})");
-            }
-            else
-            {
-                Console.WriteLine($"[Lesson {lessonNumber} · word {promptIndex}] {promptText} -> {answer}");
-            }
+            var answer = candidateAnswers[i];
+            Console.WriteLine(candidateAnswers.Count > 1 || i > 0
+                ? $"[Lesson {lessonNumber} · word {promptIndex}] {promptText} -> {answer}  (option {i + 1}/{candidateAnswers.Count})"
+                : $"[Lesson {lessonNumber} · word {promptIndex}] {promptText} -> {answer}");
 
-            var outcome = SubmitBestEffortAnswer(answer);
-
+            var outcome = SubmitAnswerInPage(answer);
             if (outcome == LessonAnswerOutcome.Accepted)
             {
                 return ContinueAfterAnswer(promptText);
@@ -172,112 +390,65 @@ internal sealed class LessonRunner
                 return true;
             }
 
-            if (candidateIndex < candidateAnswers.Count - 1)
+            if (i == candidateAnswers.Count - 1)
             {
-                Console.WriteLine(
-                    $"Answer '{answer}' was rejected for '{promptText}'. Trying the next stored translation for this exact prompt only.");
-                continue;
+                throw new InvalidOperationException($"All {candidateAnswers.Count} stored answers were rejected for lesson prompt '{promptText}'.");
             }
 
-            throw new InvalidOperationException(
-                $"All {candidateAnswers.Count} stored answers were rejected for lesson prompt '{promptText}'.");
+            Console.WriteLine($"Answer '{answer}' was rejected for '{promptText}'. Trying the next stored translation for this exact prompt only.");
         }
 
         return false;
     }
 
-    private LessonAnswerOutcome SubmitBestEffortAnswer(string answer)
+    private LessonAnswerOutcome SubmitAnswerInPage(string answer)
     {
-        if (TrySubmitAnswerViaAjax(answer, out var ajaxOutcome))
+        var answerInput = _page.WaitUntilClickable(Selectors.LessonAnswerInput);
+        if (!TryPopulateAnswerInput(answerInput, answer))
         {
-            return ajaxOutcome;
-        }
-
-        var answerInput = WaitUntilClickable(Selectors.LessonAnswerInput);
-        SubmitAnswer(answerInput, answer);
-        return WaitForAnswerOutcome();
-    }
-
-    private void SubmitAnswer(IWebElement answerInput, string answer)
-    {
-        var populatedWithFastPath = TryPopulateAnswerInput(answerInput, answer);
-        if (populatedWithFastPath && TryInvokePageAction())
-        {
-            return;
-        }
-
-        ScrollIntoView(answerInput);
-        if (!populatedWithFastPath)
-        {
+            _page.ScrollIntoView(answerInput);
             answerInput.SendKeys(Keys.Control + "a");
             answerInput.SendKeys(Keys.Delete);
             answerInput.SendKeys(answer);
         }
 
-        if (TryClickAnswerActionButton())
+        if (!TryClickContinueButton())
         {
-            return;
+            answerInput.SendKeys(Keys.Enter);
         }
 
-        answerInput.SendKeys(Keys.Enter);
+        return WaitForAnswerOutcome();
     }
 
+    /// <summary>
+    /// Sets the value through the native setter and raises the events the page's framework
+    /// listens for, so a controlled input actually registers the text.
+    /// </summary>
     private bool TryPopulateAnswerInput(IWebElement answerInput, string answer)
     {
         try
         {
-            var result = ((IJavaScriptExecutor)_driver).ExecuteScript(
-                """
-                const input = arguments[0];
-                const value = arguments[1];
-
-                const descriptor =
-                    Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input), 'value') ||
-                    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
-
-                if (!descriptor || typeof descriptor.set !== 'function') {
-                    return false;
-                }
-
-                input.focus();
-                descriptor.set.call(input, '');
-                input.dispatchEvent(new Event('input', { bubbles: true }));
-                descriptor.set.call(input, value);
-                input.dispatchEvent(new Event('input', { bubbles: true }));
-                input.dispatchEvent(new Event('change', { bubbles: true }));
-                return true;
-                """,
-                answerInput,
-                answer);
-
-            return result is bool populated && populated;
+            return _page.ExecuteScript(PopulateAnswerScript, answerInput, answer) is true;
         }
-        catch (Exception)
+        catch (WebDriverException)
         {
             return false;
         }
     }
 
-    private bool TryClickAnswerActionButton()
+    private bool TryClickContinueButton()
     {
         try
         {
-            if (TryInvokePageAction())
-            {
-                return true;
-            }
-
-            if (!TryFindVisible(_driver, Selectors.LessonContinueButton.ToBy(), out var button) ||
-                button is null ||
-                !button.Enabled)
+            if (!_page.TryFindVisible(Selectors.LessonContinueButton, out var button) || button is not { Enabled: true })
             {
                 return false;
             }
 
-            ClickElement(button);
+            _page.Click(button);
             return true;
         }
-        catch (Exception)
+        catch (WebDriverException)
         {
             return false;
         }
@@ -285,70 +456,29 @@ internal sealed class LessonRunner
 
     private LessonAnswerOutcome WaitForAnswerOutcome()
     {
-        var feedbackBy = Selectors.LessonFeedbackMarker.ToBy();
+        var correctBy = Selectors.LessonFeedbackMarker.ToBy();
         var incorrectBy = Selectors.LessonIncorrectAnswerMarker.ToBy();
-        var continueBy = Selectors.LessonContinueButton.ToBy();
 
-        var result = CreateWait().Until(driver =>
+        var outcome = _page.Wait().Until<LessonAnswerOutcome?>(driver =>
         {
             if (IsLessonFinished())
             {
-                return "finished";
+                return LessonAnswerOutcome.Finished;
             }
 
-            if (!TryFindVisible(driver, feedbackBy, out _))
+            if (_page.TryFindVisible(incorrectBy, out _))
             {
-                return null;
+                return LessonAnswerOutcome.Rejected;
             }
 
-            if (TryFindVisible(driver, incorrectBy, out var incorrectElement) &&
-                incorrectElement is not null &&
-                !string.IsNullOrWhiteSpace(incorrectElement.Text))
-            {
-                return "rejected";
-            }
+            return _page.TryFindVisible(correctBy, out _) ? LessonAnswerOutcome.Accepted : null;
+        });
 
-            if (TryFindVisible(driver, continueBy, out var continueButton) && continueButton is not null)
-            {
-                var buttonClasses = continueButton.GetDomAttribute("class") ?? string.Empty;
-                if (buttonClasses.Contains("btn-danger", StringComparison.OrdinalIgnoreCase))
-                {
-                    return "rejected";
-                }
-
-                if (buttonClasses.Contains("btn-primary", StringComparison.OrdinalIgnoreCase))
-                {
-                    return "accepted";
-                }
-            }
-
-            return null;
-        }) ?? throw new WebDriverTimeoutException("Timed out waiting for the lesson to accept or reject the submitted answer.");
-
-        return result switch
-        {
-            "accepted" => LessonAnswerOutcome.Accepted,
-            "rejected" => LessonAnswerOutcome.Rejected,
-            "finished" => LessonAnswerOutcome.Finished,
-            _ => throw new InvalidOperationException($"Unexpected lesson outcome '{result}'.")
-        };
+        return outcome ?? throw new WebDriverTimeoutException("Timed out waiting for the lesson to accept or reject the submitted answer.");
     }
 
     private bool IsLessonFinished()
-    {
-        var currentUrl = _driver.Url ?? string.Empty;
-        if (!currentUrl.Contains("/s/lesson/", StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-
-        if (Selectors.LessonFinishedMarker.TryToBy(out var finishedBy) && finishedBy is not null)
-        {
-            return TryFindVisible(_driver, finishedBy, out _);
-        }
-
-        return false;
-    }
+        => !_page.UrlContains("/learning/") || _page.TryFindVisible(Selectors.LessonFinishedMarker, out _);
 
     private bool ContinueAfterAnswer(string previousPromptText)
     {
@@ -357,34 +487,18 @@ internal sealed class LessonRunner
             return true;
         }
 
-        var previousExerciseIdentifier = TryGetCurrentExerciseIdentifier();
-
-        if (!TryInvokePageAction())
-        {
-            var continueButton = WaitUntilClickable(Selectors.LessonContinueButton);
-            ClickElement(continueButton);
-        }
-
-        CreateWait().Until(_ =>
+        _page.Click(_page.WaitUntilClickable(Selectors.LessonContinueButton));
+        _page.Wait().Until(_ =>
         {
             if (IsLessonFinished())
             {
                 return true;
             }
 
-            if (HasExerciseChanged(previousExerciseIdentifier))
-            {
-                return true;
-            }
-
-            var currentStep = ReadCurrentLessonStep();
-            if (currentStep.Kind != LessonStepKind.Prompt || currentStep.PromptElement is null)
-            {
-                return false;
-            }
-
-            var currentPromptText = TextNormalizer.Normalize(currentStep.PromptElement.Text);
-            return !string.Equals(currentPromptText, previousPromptText, StringComparison.OrdinalIgnoreCase);
+            var state = ReadCurrentLessonStep();
+            return state.Kind == LessonStepKind.Prompt
+                && state.PromptElement is not null
+                && !string.Equals(TextNormalizer.Normalize(state.PromptElement.Text), previousPromptText, StringComparison.OrdinalIgnoreCase);
         });
 
         return IsLessonFinished();
@@ -397,229 +511,55 @@ internal sealed class LessonRunner
             return;
         }
 
-        var previousExerciseIdentifier = TryGetCurrentExerciseIdentifier();
-        if (!TryInvokePageAction())
-        {
-            var continueButton = WaitUntilClickable(Selectors.LessonContinueButton);
-            ClickElement(continueButton);
-        }
-
-        CreateWait().Until(_ =>
-        {
-            if (IsLessonFinished())
-            {
-                return true;
-            }
-
-            if (HasExerciseChanged(previousExerciseIdentifier))
-            {
-                return true;
-            }
-
-            var currentStep = ReadCurrentLessonStep();
-            return currentStep.Kind != LessonStepKind.ContinueOnly;
-        });
-    }
-
-    private bool HasExerciseChanged(string previousExerciseIdentifier)
-    {
-        if (IsPageActionInProgress())
-        {
-            return false;
-        }
-
-        var currentExerciseIdentifier = TryGetCurrentExerciseIdentifier();
-        if (!string.IsNullOrWhiteSpace(previousExerciseIdentifier) &&
-            !string.IsNullOrWhiteSpace(currentExerciseIdentifier) &&
-            !string.Equals(previousExerciseIdentifier, currentExerciseIdentifier, StringComparison.Ordinal))
-        {
-            return true;
-        }
-
-        return false;
-    }
-
-    private bool TrySubmitAnswerViaAjax(string answer, out LessonAnswerOutcome outcome)
-    {
-        try
-        {
-            var rawResult = ((IJavaScriptExecutor)_driver).ExecuteAsyncScript(
-                """
-                const answer = arguments[0];
-                const callback = arguments[arguments.length - 1];
-
-                try {
-                    if (typeof exerciseIdentifier === 'undefined') {
-                        callback('error:missing-exercise-identifier');
-                        return;
-                    }
-
-                    $.ajax({
-                        url: '/s/answer/' + exerciseIdentifier,
-                        type: 'POST',
-                        contentType: 'application/json',
-                        data: JSON.stringify({ answer: answer }),
-                        dataType: 'json',
-                        success: function(data, textStatus, xhr) {
-                            const contentType = xhr.getResponseHeader('content-type') || '';
-                            if (!contentType.includes('application/json') || !data || data.status !== 'success') {
-                                callback('error:unexpected-response');
-                                return;
-                            }
-
-                            showAnswer(data.details);
-                            callback(data.details.result === 0 ? 'rejected' : 'accepted');
-                        },
-                        error: function() {
-                            callback('error:ajax-failed');
-                        }
-                    });
-                } catch (error) {
-                    callback('error:' + (error && error.message ? error.message : String(error)));
-                }
-                """,
-                answer);
-
-            var result = rawResult?.ToString() ?? "error:empty-result";
-
-            outcome = result switch
-            {
-                "accepted" => LessonAnswerOutcome.Accepted,
-                "rejected" => LessonAnswerOutcome.Rejected,
-                "finished" => LessonAnswerOutcome.Finished,
-                _ => default
-            };
-
-            return result is "accepted" or "rejected" or "finished";
-        }
-        catch (Exception)
-        {
-            outcome = default;
-            return false;
-        }
+        _page.Click(_page.WaitUntilClickable(Selectors.LessonContinueButton));
+        _page.Wait().Until(_ => IsLessonFinished() || ReadCurrentLessonStep().Kind != LessonStepKind.ContinueOnly);
     }
 
     private LessonStepState WaitForStepOrLessonFinished()
     {
-        var result = CreateWait().Until<object?>(_ =>
+        var state = _page.Wait().Until(_ =>
         {
-            var step = ReadCurrentLessonStep();
-            return step.Kind == LessonStepKind.Waiting ? null : step;
+            var current = ReadCurrentLessonStep();
+            return current.Kind != LessonStepKind.Waiting ? current : null;
         });
 
-        return result as LessonStepState ?? new LessonStepState(LessonStepKind.Finished, null);
+        return state ?? new LessonStepState(LessonStepKind.Finished, null);
     }
 
     private LessonStepState ReadCurrentLessonStep()
     {
-        if (HasLessonLimitReached())
-        {
-            return new LessonStepState(LessonStepKind.Blocked, null);
-        }
-
         if (IsLessonFinished())
         {
             return new LessonStepState(LessonStepKind.Finished, null);
         }
 
-        var promptVisible = TryFindVisible(_driver, Selectors.LessonPrompt.ToBy(), out var promptElement) && promptElement is not null;
-        var inputVisible = TryFindVisible(_driver, Selectors.LessonAnswerInput.ToBy(), out _);
-        var continueVisible = TryFindVisible(_driver, Selectors.LessonContinueButton.ToBy(), out _);
+        var hasPrompt = _page.TryFindVisible(Selectors.LessonPrompt, out var prompt) && prompt is not null;
+        var hasInput = _page.TryFindVisible(Selectors.LessonAnswerInput, out _);
+        var hasContinue = _page.TryFindVisible(Selectors.LessonContinueButton, out _);
 
-        if (promptVisible && inputVisible)
+        if (hasPrompt && hasInput)
         {
-            return new LessonStepState(LessonStepKind.Prompt, promptElement);
+            return new LessonStepState(LessonStepKind.Prompt, prompt);
         }
 
-        if (continueVisible && !inputVisible)
-        {
-            return new LessonStepState(LessonStepKind.ContinueOnly, null);
-        }
-
-        return new LessonStepState(LessonStepKind.Waiting, null);
+        return hasContinue && !hasInput
+            ? new LessonStepState(LessonStepKind.ContinueOnly, null)
+            : new LessonStepState(LessonStepKind.Waiting, null);
     }
 
-    private LessonEntryState ReadLessonEntryState()
-    {
-        if (HasLessonLimitReached())
-        {
-            return LessonEntryState.Blocked;
-        }
-
-        if (ReadCurrentLessonStep().Kind != LessonStepKind.Waiting)
-        {
-            return LessonEntryState.Ready;
-        }
-
-        var currentUrl = _driver.Url ?? string.Empty;
-        if (currentUrl.Contains("/s/lesson/", StringComparison.OrdinalIgnoreCase) &&
-            TryFindVisible(_driver, Selectors.MainLearnButton.ToBy(), out var resumeButton) &&
-            resumeButton is not null &&
-            resumeButton.Enabled)
-        {
-            return LessonEntryState.ResumeRequired;
-        }
-
-        return LessonEntryState.Waiting;
-    }
-
-    private bool IsPageActionInProgress()
-    {
-        try
-        {
-            var result = ((IJavaScriptExecutor)_driver).ExecuteScript(
-                "return typeof inProgress !== 'undefined' ? inProgress > 0 : false;");
-
-            return result is bool isBusy && isBusy;
-        }
-        catch (Exception)
-        {
-            return false;
-        }
-    }
-
-    private string TryGetCurrentExerciseIdentifier()
-    {
-        try
-        {
-            var result = ((IJavaScriptExecutor)_driver).ExecuteScript(
-                "return typeof exerciseIdentifier !== 'undefined' ? String(exerciseIdentifier) : '';");
-
-            return result?.ToString() ?? string.Empty;
-        }
-        catch (Exception)
-        {
-            return string.Empty;
-        }
-    }
-
-    private bool HasLessonLimitReached()
-    {
-        return TryFindVisible(_driver, Selectors.LessonLimitOfferButton.ToBy(), out _);
-    }
-
-    private void ThrowIfLessonLimitReached()
-    {
-        if (!HasLessonLimitReached())
-        {
-            return;
-        }
-
-        throw new LessonLimitReachedException(
-            "Lingos reported that today's lesson limit has been reached for this account. The bot stopped cleanly.");
-    }
+    // ---- vocabulary lookup ------------------------------------------------
 
     private IReadOnlyList<string> ResolveCandidateAnswers(string prompt)
     {
-        if (_vocabulary.TryGetValue(prompt, out var directMatches))
+        if (_vocabulary.TryGetValue(prompt, out var answers))
         {
-            return directMatches;
+            return answers;
         }
 
-        if (_reverseVocabulary.TryGetValue(prompt, out var reverseMatches))
+        if (_reverseVocabulary.TryGetValue(prompt, out var reversed))
         {
             Console.WriteLine($"Prompt '{prompt}' matched the reverse vocabulary lookup.");
-            return reverseMatches;
+            return reversed;
         }
 
         return Array.Empty<string>();
@@ -629,189 +569,39 @@ internal sealed class LessonRunner
         IReadOnlyDictionary<string, IReadOnlyList<string>> vocabulary)
     {
         var reverse = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        var seen = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var pair in vocabulary)
+        foreach (var (prompt, answers) in vocabulary)
         {
-            foreach (var foreignWord in pair.Value)
+            foreach (var answer in answers)
             {
-                var normalizedForeignWord = TextNormalizer.Normalize(foreignWord);
-                if (string.IsNullOrWhiteSpace(normalizedForeignWord))
+                var key = TextNormalizer.Normalize(answer);
+                if (string.IsNullOrWhiteSpace(key))
                 {
                     continue;
                 }
 
-                if (!reverse.TryGetValue(normalizedForeignWord, out var candidates))
+                if (!reverse.TryGetValue(key, out var prompts))
                 {
-                    candidates = new List<string>();
-                    reverse[normalizedForeignWord] = candidates;
+                    prompts = new List<string>(1);
+                    reverse[key] = prompts;
+                    seen[key] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 }
 
-                if (!candidates.Any(candidate => string.Equals(candidate, pair.Key, StringComparison.OrdinalIgnoreCase)))
+                if (seen[key].Add(prompt))
                 {
-                    candidates.Add(pair.Key);
+                    prompts.Add(prompt);
                 }
             }
         }
 
-        return reverse.ToDictionary(pair => pair.Key, pair => (IReadOnlyList<string>)pair.Value.AsReadOnly(), StringComparer.OrdinalIgnoreCase);
-    }
-
-    private bool TryInvokePageAction()
-    {
-        try
+        var result = new Dictionary<string, IReadOnlyList<string>>(reverse.Count, StringComparer.OrdinalIgnoreCase);
+        foreach (var (key, prompts) in reverse)
         {
-            var result = ((IJavaScriptExecutor)_driver).ExecuteScript(
-                """
-                if (typeof callAction !== 'function') {
-                    return false;
-                }
-
-                callAction();
-                return true;
-                """);
-
-            return result is bool succeeded && succeeded;
+            result[key] = prompts.AsReadOnly();
         }
-        catch (Exception)
-        {
-            return false;
-        }
-    }
 
-    private bool TryFindVisible(ISearchContext context, By by, out IWebElement? element)
-    {
-        try
-        {
-            element = context.FindElement(by);
-            return element.Displayed;
-        }
-        catch (NoSuchElementException)
-        {
-            element = null;
-            return false;
-        }
-        catch (StaleElementReferenceException)
-        {
-            element = null;
-            return false;
-        }
-    }
-
-    private IWebElement WaitUntilVisible(SelectorDefinition selector)
-    {
-        var by = selector.ToBy();
-
-        return CreateWait().Until(driver =>
-        {
-            try
-            {
-                var element = driver.FindElement(by);
-                return element.Displayed ? element : null;
-            }
-            catch (NoSuchElementException)
-            {
-                return null;
-            }
-            catch (StaleElementReferenceException)
-            {
-                return null;
-            }
-        }) ?? throw new WebDriverTimeoutException($"Timed out waiting for selector '{selector.Name}' to become visible.");
-    }
-
-    private IWebElement WaitUntilClickable(SelectorDefinition selector)
-    {
-        var by = selector.ToBy();
-
-        return CreateWait().Until(driver =>
-        {
-            try
-            {
-                var element = driver.FindElement(by);
-                return element.Displayed && element.Enabled ? element : null;
-            }
-            catch (NoSuchElementException)
-            {
-                return null;
-            }
-            catch (StaleElementReferenceException)
-            {
-                return null;
-            }
-        }) ?? throw new WebDriverTimeoutException($"Timed out waiting for selector '{selector.Name}' to become clickable.");
-    }
-
-    private bool TryWaitUntilClickable(SelectorDefinition selector, TimeSpan timeout, out IWebElement? element)
-    {
-        try
-        {
-            element = WaitUntilClickable(selector, timeout);
-            return true;
-        }
-        catch (WebDriverTimeoutException)
-        {
-            element = null;
-            return false;
-        }
-    }
-
-    private IWebElement WaitUntilClickable(SelectorDefinition selector, TimeSpan timeout)
-    {
-        var by = selector.ToBy();
-
-        return CreateWait(timeout).Until(driver =>
-        {
-            try
-            {
-                var clickableElement = driver.FindElement(by);
-                return clickableElement.Displayed && clickableElement.Enabled ? clickableElement : null;
-            }
-            catch (NoSuchElementException)
-            {
-                return null;
-            }
-            catch (StaleElementReferenceException)
-            {
-                return null;
-            }
-        }) ?? throw new WebDriverTimeoutException($"Timed out waiting for selector '{selector.Name}' to become clickable.");
-    }
-
-    private void WaitForDocumentReady()
-    {
-        CreateWait().Until(driver =>
-        {
-            var state = ((IJavaScriptExecutor)driver).ExecuteScript("return document.readyState");
-            return string.Equals(state?.ToString(), "complete", StringComparison.OrdinalIgnoreCase);
-        });
-    }
-
-    private WebDriverWait CreateWait(TimeSpan? timeout = null)
-    {
-        var wait = new WebDriverWait(new SystemClock(), _driver, timeout ?? _config.DefaultWaitTimeout, _config.PollingInterval);
-        wait.IgnoreExceptionTypes(typeof(NoSuchElementException), typeof(StaleElementReferenceException));
-        return wait;
-    }
-
-    private void ClickElement(IWebElement element)
-    {
-        ScrollIntoView(element);
-
-        try
-        {
-            element.Click();
-        }
-        catch (ElementClickInterceptedException)
-        {
-            ((IJavaScriptExecutor)_driver).ExecuteScript("arguments[0].click();", element);
-        }
-    }
-
-    private void ScrollIntoView(IWebElement element)
-    {
-        ((IJavaScriptExecutor)_driver).ExecuteScript(
-            "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
-            element);
+        return result;
     }
 }
 
@@ -829,14 +619,6 @@ internal enum LessonStepKind
     ContinueOnly,
     Blocked,
     Finished
-}
-
-internal enum LessonEntryState
-{
-    Waiting,
-    Ready,
-    ResumeRequired,
-    Blocked
 }
 
 internal sealed record LessonStepState(LessonStepKind Kind, IWebElement? PromptElement);

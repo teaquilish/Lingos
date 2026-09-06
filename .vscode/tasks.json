@@ -1,0 +1,77 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build",
+            "detail": "Compile only - fastest way to check the code still compiles.",
+            "command": "C:\\Users\\yurii\\.dotnet\\dotnet.exe",
+            "type": "process",
+            "args": [
+                "build",
+                "${workspaceFolder}/LingosBot.sln",
+                "/property:GenerateFullPaths=true",
+                "/consoleloggerparameters:NoSummary"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": "$msCompile"
+        },
+        {
+            "label": "publish exe",
+            "detail": "Build the self-contained LingosBot.exe into ./publish-output.",
+            "command": "C:\\Users\\yurii\\.dotnet\\dotnet.exe",
+            "type": "process",
+            "args": [
+                "publish",
+                "${workspaceFolder}/LingosBot/LingosBot.csproj",
+                "-c",
+                "Release",
+                "-r",
+                "win-x64",
+                "--self-contained",
+                "true",
+                "-p:PublishSingleFile=true",
+                "-o",
+                "${workspaceFolder}/publish-output",
+                "/property:GenerateFullPaths=true",
+                "/consoleloggerparameters:NoSummary"
+            ],
+            "problemMatcher": "$msCompile"
+        },
+        {
+            "label": "publish + deploy to Downloads",
+            "detail": "Publish, then copy the exe over the one you actually run in Downloads\\LingosBot.",
+            "dependsOn": "publish exe",
+            "command": "powershell",
+            "type": "process",
+            "args": [
+                "-NoProfile",
+                "-Command",
+                "Copy-Item '${workspaceFolder}/publish-output/LingosBot.exe' 'C:/Users/yurii/Downloads/LingosBot/LingosBot.exe' -Force; Write-Host 'Deployed to C:\\Users\\yurii\\Downloads\\LingosBot\\LingosBot.exe'"
+            ],
+            "problemMatcher": []
+        },
+        {
+            "label": "run (publish-output)",
+            "detail": "Run the published exe from its own folder so it sees credentials.json.",
+            "command": "${workspaceFolder}/publish-output/LingosBot.exe",
+            "type": "process",
+            "options": {
+                "cwd": "${workspaceFolder}/publish-output"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "clean",
+            "command": "C:\\Users\\yurii\\.dotnet\\dotnet.exe",
+            "type": "process",
+            "args": [
+                "clean",
+                "${workspaceFolder}/LingosBot.sln"
+            ],
+            "problemMatcher": []
+        }
+    ]
+}

@@ -1,39 +1,40 @@
 using OpenQA.Selenium;
-using OpenQA.Selenium.Support.UI;
 
 namespace LingosBotApp;
 
 internal sealed class LoginService
 {
-    private readonly IWebDriver _driver;
+    private readonly PageAgent _page;
     private readonly AppConfig _config;
 
     public LoginService(IWebDriver driver, AppConfig config)
+        : this(new PageAgent(driver, config))
     {
-        _driver = driver;
-        _config = config;
+    }
+
+    public LoginService(PageAgent page)
+    {
+        _page = page;
+        _config = page.Config;
     }
 
     public void Login(AppCredentials credentials)
     {
         Console.WriteLine("Opening lingos.pl...");
-        _driver.Navigate().GoToUrl($"{_config.BaseUrl}/h/login");
-        WaitForDocumentReady();
-
+        _page.GoTo(_config.LoginUrl);
+        _page.WaitForDocumentReady();
         HandleCookieConsent();
 
         Console.WriteLine("Submitting login form...");
+        var email = _page.WaitUntilVisible(Selectors.LoginEmailInput);
+        email.Clear();
+        email.SendKeys(credentials.Email);
 
-        var emailInput = WaitUntilVisible(Selectors.LoginEmailInput);
-        emailInput.Clear();
-        emailInput.SendKeys(credentials.Email);
+        var password = _page.WaitUntilVisible(Selectors.LoginPasswordInput);
+        password.Clear();
+        password.SendKeys(credentials.Password);
 
-        var passwordInput = WaitUntilVisible(Selectors.LoginPasswordInput);
-        passwordInput.Clear();
-        passwordInput.SendKeys(credentials.Password);
-
-        var submitButton = WaitUntilClickable(Selectors.LoginSubmitButton);
-        ClickElement(submitButton);
+        _page.Click(_page.WaitUntilClickable(Selectors.LoginSubmitButton));
 
         try
         {
@@ -49,143 +50,21 @@ internal sealed class LoginService
     }
 
     private void WaitForSuccessfulLogin()
-    {
-        var loginPath = "/h/login";
-
-        CreateWait().Until(driver =>
-        {
-            var currentUrl = driver.Url ?? string.Empty;
-            if (!currentUrl.Contains(loginPath, StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
-
-            if (Selectors.AuthenticatedShellMarker.TryToBy(out var authenticatedBy) &&
-                authenticatedBy is not null &&
-                TryFindVisible(driver, authenticatedBy, out _))
-            {
-                return true;
-            }
-
-            return false;
-        });
-    }
+        => _page.Wait().Until(driver => !_page.UrlContains("/h/login")
+            || _page.TryFindVisible(Selectors.AuthenticatedShellMarker, out _));
 
     private void HandleCookieConsent()
     {
         Console.WriteLine("Handling cookie consent...");
-
-        try
+        if (_page.TryWaitUntilClickable(Selectors.CookieAcceptButton, _config.ShortWaitTimeout, out var accept) && accept is not null)
         {
-            var cookieButton = WaitUntilClickable(Selectors.CookieAcceptButton, _config.ShortWaitTimeout);
-            ClickElement(cookieButton);
-            WaitForDocumentReady();
+            _page.Click(accept);
+            _page.WaitForDocumentReady();
             Console.WriteLine("Cookie consent accepted.");
+            return;
         }
-        catch (WebDriverTimeoutException)
-        {
-            Console.WriteLine("Cookie consent button was not visible within the short timeout. Continuing.");
-        }
-    }
 
-    private IWebElement WaitUntilVisible(SelectorDefinition selector, TimeSpan? timeout = null)
-    {
-        var by = selector.ToBy();
-
-        return CreateWait(timeout).Until(driver =>
-        {
-            try
-            {
-                var element = driver.FindElement(by);
-                return element.Displayed ? element : null;
-            }
-            catch (NoSuchElementException)
-            {
-                return null;
-            }
-            catch (StaleElementReferenceException)
-            {
-                return null;
-            }
-        }) ?? throw new WebDriverTimeoutException($"Timed out waiting for selector '{selector.Name}' to become visible.");
-    }
-
-    private IWebElement WaitUntilClickable(SelectorDefinition selector, TimeSpan? timeout = null)
-    {
-        var by = selector.ToBy();
-
-        return CreateWait(timeout).Until(driver =>
-        {
-            try
-            {
-                var element = driver.FindElement(by);
-                return element.Displayed && element.Enabled ? element : null;
-            }
-            catch (NoSuchElementException)
-            {
-                return null;
-            }
-            catch (StaleElementReferenceException)
-            {
-                return null;
-            }
-        }) ?? throw new WebDriverTimeoutException($"Timed out waiting for selector '{selector.Name}' to become clickable.");
-    }
-
-    private void WaitForDocumentReady()
-    {
-        CreateWait().Until(driver =>
-        {
-            var state = ((IJavaScriptExecutor)driver).ExecuteScript("return document.readyState");
-            return string.Equals(state?.ToString(), "complete", StringComparison.OrdinalIgnoreCase);
-        });
-    }
-
-    private WebDriverWait CreateWait(TimeSpan? timeout = null)
-    {
-        var wait = new WebDriverWait(new SystemClock(), _driver, timeout ?? _config.DefaultWaitTimeout, _config.PollingInterval);
-        wait.IgnoreExceptionTypes(typeof(NoSuchElementException), typeof(StaleElementReferenceException));
-        return wait;
-    }
-
-    private void ClickElement(IWebElement element)
-    {
-        ScrollIntoView(element);
-
-        try
-        {
-            element.Click();
-        }
-        catch (ElementClickInterceptedException)
-        {
-            ((IJavaScriptExecutor)_driver).ExecuteScript("arguments[0].click();", element);
-        }
-    }
-
-    private void ScrollIntoView(IWebElement element)
-    {
-        ((IJavaScriptExecutor)_driver).ExecuteScript(
-            "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
-            element);
-    }
-
-    private static bool TryFindVisible(ISearchContext context, By by, out IWebElement? element)
-    {
-        try
-        {
-            element = context.FindElement(by);
-            return element.Displayed;
-        }
-        catch (NoSuchElementException)
-        {
-            element = null;
-            return false;
-        }
-        catch (StaleElementReferenceException)
-        {
-            element = null;
-            return false;
-        }
+        Console.WriteLine("Cookie consent button was not visible within the short timeout. Continuing.");
     }
 }
 

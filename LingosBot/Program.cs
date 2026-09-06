@@ -12,16 +12,21 @@ internal static class Program
         Console.WriteLine();
 
         var config = new AppConfig();
-        var credentialStore = new CredentialStore(config);
+        var credentialStore = new CredentialStore(config.CredentialFilePath);
+        var secondaryStore = new CredentialStore(config.SecondaryCredentialFilePath);
         var browserFactory = new BrowserFactory();
 
         // First run: if no login is stored yet, set one up before showing the menu.
         EnsureCredentialsExist(credentialStore);
 
-        return RunMainMenu(config, credentialStore, browserFactory);
+        return RunMainMenu(config, credentialStore, secondaryStore, browserFactory);
     }
 
-    private static int RunMainMenu(AppConfig config, CredentialStore credentialStore, BrowserFactory browserFactory)
+    private static int RunMainMenu(
+        AppConfig config,
+        CredentialStore credentialStore,
+        CredentialStore secondaryStore,
+        BrowserFactory browserFactory)
     {
         while (true)
         {
@@ -30,7 +35,9 @@ internal static class Program
             Console.WriteLine();
             Console.WriteLine("=== Main menu ===");
             Console.WriteLine(current is not null ? $"Signed in as: {current.Email}" : "No account set yet.");
-            Console.WriteLine($"  [{config.MinLessonCount}+]   Run lessons (auto-picks Wyzwania challenges)");
+            Console.WriteLine($"  [{config.MinLessonCount}+]   Run lessons on the current class (auto-picks challenges)");
+            Console.WriteLine($"  [U]    Usual mode  - all your classes, {config.LessonsPerClass} lessons each");
+            Console.WriteLine("  [M]    Modified    - all classes on BOTH accounts");
             Console.WriteLine("  [R]    Change email / password");
             Console.WriteLine("  [Q]    Quit");
             Console.Write("> ");
@@ -49,6 +56,20 @@ internal static class Program
                 continue;
             }
 
+            if (string.Equals(input, "U", StringComparison.OrdinalIgnoreCase))
+            {
+                RunBotAction(config, credentialStore, browserFactory, bot => bot.RunUsual());
+                continue;
+            }
+
+            if (string.Equals(input, "M", StringComparison.OrdinalIgnoreCase))
+            {
+                RunBotAction(config, credentialStore, browserFactory, bot => bot.RunModified(
+                    secondaryStore,
+                    () => PromptForCredentials(allowBack: false, "the SECOND account")!));
+                continue;
+            }
+
             if (int.TryParse(input, out var lessonCount) &&
                 lessonCount >= config.MinLessonCount)
             {
@@ -57,7 +78,7 @@ internal static class Program
             }
 
             Console.WriteLine(
-                $"Sorry, I didn't get that. Enter a number ({config.MinLessonCount} or more), or C, R, or Q.");
+                $"Sorry, I didn't get that. Enter a number ({config.MinLessonCount} or more), or U, M, R, or Q.");
         }
     }
 
@@ -139,10 +160,12 @@ internal static class Program
 
     // --- Shared prompts --------------------------------------------------
 
-    private static AppCredentials? PromptForCredentials(bool allowBack)
+    private static AppCredentials? PromptForCredentials(bool allowBack, string? whichAccount = null)
     {
         Console.WriteLine();
-        Console.WriteLine("Enter your lingos.pl credentials.");
+        Console.WriteLine(whichAccount is null
+            ? "Enter your lingos.pl credentials."
+            : $"Enter the lingos.pl credentials for {whichAccount}.");
         if (allowBack)
         {
             Console.WriteLine("(Type B and press Enter at the email prompt to go back without changing anything.)");

@@ -8,30 +8,30 @@ internal sealed class CredentialStore
 {
     private static readonly byte[] AdditionalEntropy = Encoding.UTF8.GetBytes("LingosBot.Credentials.v1");
 
-    private readonly AppConfig _config;
+    private readonly string _filePath;
     private readonly JsonSerializerOptions _serializerOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         WriteIndented = true
     };
 
-    public CredentialStore(AppConfig config)
+    public CredentialStore(string filePath)
     {
-        _config = config;
+        _filePath = filePath;
     }
 
     public bool TryLoad(out AppCredentials? credentials)
     {
         credentials = null;
 
-        if (!File.Exists(_config.CredentialFilePath))
+        if (!File.Exists(_filePath))
         {
             return false;
         }
 
         try
         {
-            var json = File.ReadAllText(_config.CredentialFilePath);
+            var json = File.ReadAllText(_filePath);
             var stored = JsonSerializer.Deserialize<StoredCredentials>(json, _serializerOptions);
 
             if (stored is null || string.IsNullOrWhiteSpace(stored.Email) || string.IsNullOrWhiteSpace(stored.ProtectedPassword))
@@ -61,21 +61,21 @@ internal sealed class CredentialStore
             ProtectionMode = protectionMode
         };
 
-        var directory = Path.GetDirectoryName(_config.CredentialFilePath);
+        var directory = Path.GetDirectoryName(_filePath);
         if (!string.IsNullOrWhiteSpace(directory))
         {
             Directory.CreateDirectory(directory);
         }
 
         var json = JsonSerializer.Serialize(payload, _serializerOptions);
-        File.WriteAllText(_config.CredentialFilePath, json, Encoding.UTF8);
+        File.WriteAllText(_filePath, json, Encoding.UTF8);
     }
 
     public void Delete()
     {
-        if (File.Exists(_config.CredentialFilePath))
+        if (File.Exists(_filePath))
         {
-            File.Delete(_config.CredentialFilePath);
+            File.Delete(_filePath);
         }
     }
 

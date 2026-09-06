@@ -6,9 +6,26 @@ internal sealed class AppConfig
 {
     public string BaseUrl { get; } = "https://lingos.pl";
 
-    public string StudentDashboardUrl { get; } = "https://lingos.pl/student-confirmed/group";
+    public string LoginUrl { get; } = "https://lingos.pl/h/login";
+
+    public string StudentDashboardUrl { get; } = "https://lingos.pl/student/dashboard";
+
+    public string WordsetsUrl { get; } = "https://lingos.pl/student/wordsets";
+
+    /// <summary>Path of one wordset's page; <c>{0}</c> is the wordset id.</summary>
+    public string WordsetPathFormat { get; } = "/student/wordsets/{0}";
+
+    /// <summary>Endpoint that answers one lesson exercise; <c>{0}</c> is the lesson id.</summary>
+    public string LearningAnswerPathFormat { get; } = "/learning/answer/{0}";
+
+    /// <summary>Endpoint that joins a challenge; <c>{0}</c> is the challenge id.</summary>
+    public string ChallengeJoinPathFormat { get; } = "/student/challenges/{0}";
+
+    public string GroupSwitchPath { get; } = "/student/group";
 
     public string CredentialFilePath { get; } = Path.Combine(AppContext.BaseDirectory, "credentials.json");
+
+    public string SecondaryCredentialFilePath { get; } = Path.Combine(AppContext.BaseDirectory, "credentials-2.json");
 
     public string? ChromeBinaryPath { get; } = Environment.GetEnvironmentVariable("LINGOS_CHROME_BINARY");
 
@@ -20,9 +37,13 @@ internal sealed class AppConfig
 
     public TimeSpan PageLoadTimeout { get; } = TimeSpan.FromSeconds(60);
 
+    public TimeSpan ScriptTimeout { get; } = TimeSpan.FromSeconds(60);
+
     public TimeSpan PollingInterval { get; } = TimeSpan.FromMilliseconds(25);
 
     public int MinLessonCount { get; } = 1;
+
+    public int LessonsPerClass { get; } = 5;
 
     public int LessonPromptSafetyCap { get; } = 30;
 
@@ -31,6 +52,8 @@ internal sealed class AppConfig
 
 internal static class TextNormalizer
 {
+    private const char NonBreakingSpace = (char)0x00A0;
+
     private static readonly Regex MultipleWhitespace = new(@"\s+", RegexOptions.Compiled);
 
     public static string Normalize(string value)
@@ -40,7 +63,7 @@ internal static class TextNormalizer
             return string.Empty;
         }
 
-        var sanitized = value.Replace('\u00A0', ' ').Trim();
+        var sanitized = value.Replace(NonBreakingSpace, ' ').Trim();
         return MultipleWhitespace.Replace(sanitized, " ");
     }
 }

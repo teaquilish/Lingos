@@ -44,6 +44,7 @@ internal sealed class BrowserFactory
         var driver = new ChromeDriver(chromeService, chromeOptions);
         driver.Manage().Timeouts().PageLoad = config.PageLoadTimeout;
         driver.Manage().Timeouts().ImplicitWait = TimeSpan.Zero;
+        driver.Manage().Timeouts().AsynchronousJavaScript = config.ScriptTimeout;
 
         return driver;
     }

@@ -19,3 +19,6 @@ diagnostics/
 
 # Misc
 *.log
+
+# Published output from the VSCodium task
+publish-output/

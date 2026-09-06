@@ -1,142 +1,215 @@
+using System.Globalization;
 using System.Text.Json;
 using LingosBotApp.Models;
 using OpenQA.Selenium;
-using OpenQA.Selenium.Support.UI;
 
 namespace LingosBotApp;
 
+/// <summary>
+/// Reads every wordset assigned to the current class and builds the Polish prompt -> foreign
+/// answer lookup the lesson runner uses. The whole set is re-read on every run.
+/// </summary>
 internal sealed class VocabularyCollector
 {
-    private readonly IWebDriver _driver;
+    private const string ReadWordsetCardsScript = """
+        const cards = Array.from(document.querySelectorAll(arguments[0]));
+        const buttonSelector = arguments[1];
+        return JSON.stringify(cards.map(card => {
+            const button = card.querySelector(buttonSelector);
+            const linked = (button?.innerText || '').trim();
+            const lines = (card.innerText || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+            return { title: linked || lines[0] || (button?.href || ''), url: button?.href || '' };
+        }).filter(item => item.url));
+        """;
+
+    private const string ReadVocabularyRowsScript = """
+        const rows = Array.from(document.querySelectorAll(arguments[0]));
+        const foreignSelector = arguments[1];
+        const polishSelector = arguments[2];
+        return JSON.stringify(rows.map(row => ({
+            foreignWord: (row.querySelector(foreignSelector)?.innerText || '').trim(),
+            polishTranslation: (row.querySelector(polishSelector)?.innerText || '').trim()
+        })).filter(entry => entry.foreignWord && entry.polishTranslation));
+        """;
+
+    private readonly PageAgent _page;
     private readonly AppConfig _config;
-    private readonly JsonSerializerOptions _jsonOptions = new()
-    {
-        PropertyNameCaseInsensitive = true
-    };
 
     public VocabularyCollector(IWebDriver driver, AppConfig config)
+        : this(new PageAgent(driver, config))
     {
-        _driver = driver;
-        _config = config;
+    }
+
+    public VocabularyCollector(PageAgent page)
+    {
+        _page = page;
+        _config = page.Config;
     }
 
     public IReadOnlyDictionary<string, IReadOnlyList<string>> CollectVocabulary()
     {
         Console.WriteLine("Navigating to the Zestawy page...");
-        var zestawyButton = WaitUntilClickable(Selectors.LeftMenuZestawyButton);
-        ClickElement(zestawyButton);
-        WaitForUrlContains("/student-confirmed/wordsets");
+        OpenZestawyPage();
 
-        if (Selectors.ZestawyPageMarker.TryToBy(out _))
+        var builder = new VocabularyBuilder();
+
+        if (!TryCollectFromPageData(builder))
         {
-            WaitUntilVisible(Selectors.ZestawyPageMarker);
+            CollectByVisitingEachWordset(builder);
         }
 
-        var wordsets = CollectWordsetDescriptors();
-        Console.WriteLine($"Found {wordsets.Count} wordset(s) to process.");
-
-        var vocabulary = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-
-        for (var index = 0; index < wordsets.Count; index++)
-        {
-            var wordset = wordsets[index];
-            Console.WriteLine($"Reading wordset {index + 1}/{wordsets.Count}: {wordset.Title}");
-
-            var entries = ScrapeWordsetByNavigation(wordset);
-            AddEntries(vocabulary, entries, logAlternatives: true);
-            Console.WriteLine($"Collected {entries.Count} entries from {wordset.Title}.");
-        }
-
-        var readOnlyVocabulary = ToReadOnlyVocabulary(vocabulary);
-        Console.WriteLine($"Vocabulary collection finished. Stored {readOnlyVocabulary.Count} unique Polish prompts.");
-        return readOnlyVocabulary;
+        var result = builder.Build();
+        Console.WriteLine($"Vocabulary collection finished. Stored {result.Count} unique Polish prompts.");
+        return result;
     }
 
-    private List<WordsetDescriptor> CollectWordsetDescriptors()
+    private void OpenZestawyPage()
     {
-        var descriptors = new List<WordsetDescriptor>();
-        var pageNumber = 1;
-
-        while (true)
+        if (_page.TryWaitUntilClickable(Selectors.LeftMenuZestawyButton, _config.ShortWaitTimeout, out var menuLink) && menuLink is not null)
         {
-            Console.WriteLine($"Scanning Zestawy page {pageNumber}...");
-            WaitUntilElementsCountAtLeast(Selectors.SetCardContainer, 1);
-            var pageDescriptors = ReadWordsetDescriptorsFromPage();
-            Console.WriteLine($"Found {pageDescriptors.Count} set blocks on this page.");
-
-            descriptors.AddRange(pageDescriptors);
-
-            if (!TryGoToNextPage(pageNumber + 1))
-            {
-                break;
-            }
-
-            pageNumber++;
+            _page.Click(menuLink);
+        }
+        else
+        {
+            _page.GoTo(_config.WordsetsUrl);
         }
 
-        return descriptors
-            .GroupBy(descriptor => descriptor.Url, StringComparer.OrdinalIgnoreCase)
-            .Select(group => group.First())
+        _page.WaitForUrlContains("/student/wordsets");
+    }
+
+    // ---- fast path: the wordset pages carry their flashcards as JSON -------
+
+    /// <summary>
+    /// Reads the wordset list from the page data, then downloads every wordset page in parallel
+    /// and takes the flashcards straight out of each one's JSON payload.
+    /// </summary>
+    private bool TryCollectFromPageData(VocabularyBuilder builder)
+    {
+        var wordsets = _page.ReadProps<StudentProps>()?.Wordsets?.Wordsets;
+        if (wordsets is null || wordsets.Count == 0)
+        {
+            Console.WriteLine("Could not read the wordset list from the page data. Falling back to reading the page itself.");
+            return false;
+        }
+
+        Console.WriteLine($"Found {wordsets.Count} wordset(s) to process.");
+
+        var urls = wordsets
+            .Select(wordset => string.Format(CultureInfo.InvariantCulture, _config.WordsetPathFormat, wordset.Id))
             .ToList();
+
+        List<StudentProps?> pages;
+        try
+        {
+            pages = _page.FetchProps<StudentProps>(urls);
+        }
+        catch (WebDriverException ex)
+        {
+            Console.WriteLine($"Fast wordset download failed: {ex.Message}. Falling back to opening each wordset.");
+            return false;
+        }
+
+        var loaded = 0;
+        for (var i = 0; i < wordsets.Count; i++)
+        {
+            var wordset = wordsets[i];
+            var flashcards = i < pages.Count ? pages[i]?.Wordset?.Flashcards : null;
+            if (flashcards is null)
+            {
+                Console.WriteLine($"Could not read wordset {i + 1}/{wordsets.Count}: {wordset.Name}.");
+                continue;
+            }
+
+            foreach (var flashcard in flashcards)
+            {
+                builder.Add(flashcard.Translation, flashcard.Word);
+            }
+
+            loaded++;
+            Console.WriteLine($"Collected {flashcards.Count} entries from {wordset.Name}.");
+        }
+
+        if (loaded != 0)
+        {
+            return true;
+        }
+
+        Console.WriteLine("No wordset could be downloaded. Falling back to opening each wordset.");
+        return false;
+    }
+
+    // ---- fallback: navigate to each wordset and read the rendered rows -----
+
+    private void CollectByVisitingEachWordset(VocabularyBuilder builder)
+    {
+        var wordsets = ReadWordsetDescriptorsFromPage();
+        Console.WriteLine($"Found {wordsets.Count} wordset(s) to process.");
+
+        for (var i = 0; i < wordsets.Count; i++)
+        {
+            var wordset = wordsets[i];
+            Console.WriteLine($"Reading wordset {i + 1}/{wordsets.Count}: {wordset.Title}");
+
+            _page.GoTo(wordset.Url);
+            _page.WaitForUrlContains("/student/wordsets/");
+            var entries = ReadVocabularyEntriesFromCurrentPage();
+
+            foreach (var entry in entries)
+            {
+                builder.Add(entry.PolishTranslation, entry.ForeignWord);
+            }
+
+            Console.WriteLine($"Collected {entries.Count} entries from {wordset.Title}.");
+        }
     }
 
     private List<WordsetDescriptor> ReadWordsetDescriptorsFromPage()
     {
         try
         {
-            var rawResult = ((IJavaScriptExecutor)_driver).ExecuteScript(
-                """
-                const cards = Array.from(document.querySelectorAll(arguments[0]));
-                const buttonSelector = arguments[1];
-
-                return JSON.stringify(cards.map(card => {
-                    const button = card.querySelector(buttonSelector);
-                    const lines = (card.innerText || '')
-                        .split(/\r?\n/)
-                        .map(line => line.trim())
-                        .filter(Boolean);
-
-                    return {
-                        title: lines.length > 0 ? lines[0] : (button?.href || ''),
-                        url: button?.href || ''
-                    };
-                }).filter(item => item.url));
-                """,
+            var raw = _page.ExecuteScript(
+                ReadWordsetCardsScript,
                 GetCssSelectorValue(Selectors.SetCardContainer),
-                GetCssSelectorValue(Selectors.SetCardPreviewButton));
+                GetCssSelectorValue(Selectors.SetCardPreviewButton))?.ToString() ?? "[]";
 
-            var result = rawResult?.ToString() ?? "[]";
-            var pageDescriptors = JsonSerializer.Deserialize<List<WordsetDescriptorPayload>>(result, _jsonOptions) ?? [];
+            var payloads = JsonSerializer.Deserialize<List<WordsetDescriptorPayload>>(raw, PageAgent.Json)
+                ?? new List<WordsetDescriptorPayload>();
 
-            return pageDescriptors
-                .Where(item => !string.IsNullOrWhiteSpace(item.Url))
-                .Select(item => new WordsetDescriptor(
-                    TextNormalizer.Normalize(item.Title),
-                    ToAbsoluteUrl(item.Url)))
+            var descriptors = payloads
+                .Where(payload => !string.IsNullOrWhiteSpace(payload.Url))
+                .Select(payload => new WordsetDescriptor(TextNormalizer.Normalize(payload.Title), ToAbsoluteUrl(payload.Url)))
                 .ToList();
+
+            if (descriptors.Count > 0)
+            {
+                return Deduplicate(descriptors);
+            }
         }
         catch (Exception ex)
         {
             Console.WriteLine($"Fast Zestawy scan failed: {ex.Message}. Falling back to Selenium element reads.");
-            return ReadWordsetDescriptorsWithSelenium();
         }
+
+        return Deduplicate(ReadWordsetDescriptorsWithSelenium());
     }
 
     private List<WordsetDescriptor> ReadWordsetDescriptorsWithSelenium()
     {
         var descriptors = new List<WordsetDescriptor>();
-        var cards = WaitUntilElementsCountAtLeast(Selectors.SetCardContainer, 1);
-
-        foreach (var card in cards)
+        foreach (var card in _page.WaitUntilElementsCountAtLeast(Selectors.SetCardContainer, 1))
         {
-            var previewButton = FindChildElement(card, Selectors.SetCardPreviewButton);
-            var href = previewButton.GetDomAttribute("href") ?? string.Empty;
-            var title = TextNormalizer.Normalize(
-                card.Text.Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? href);
-
+            var link = FindChildElement(card, Selectors.SetCardPreviewButton);
+            var href = link.GetDomAttribute("href") ?? string.Empty;
             if (string.IsNullOrWhiteSpace(href))
             {
                 continue;
+            }
+
+            var title = TextNormalizer.Normalize(link.Text);
+            if (string.IsNullOrWhiteSpace(title))
+            {
+                var lines = card.Text.Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries);
+                title = TextNormalizer.Normalize(lines.Length > 0 ? lines[0] : href);
             }
 
             descriptors.Add(new WordsetDescriptor(title, ToAbsoluteUrl(href)));
@@ -145,44 +218,41 @@ internal sealed class VocabularyCollector
         return descriptors;
     }
 
-    private List<VocabularyEntry> ScrapeWordsetByNavigation(WordsetDescriptor wordset)
+    private static List<WordsetDescriptor> Deduplicate(List<WordsetDescriptor> descriptors)
     {
-        _driver.Navigate().GoToUrl(wordset.Url);
-        WaitForUrlContains("/student-confirmed/wordset/");
-        return ReadVocabularyEntriesFromCurrentPage();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        return descriptors.Where(descriptor => seen.Add(descriptor.Url)).ToList();
     }
 
     private List<VocabularyEntry> ReadVocabularyEntriesFromCurrentPage()
     {
-        WaitUntilElementsCountAtLeast(Selectors.PreviewVocabularyRow, 1);
+        var flashcards = _page.ReadProps<StudentProps>()?.Wordset?.Flashcards;
+        if (flashcards is { Count: > 0 })
+        {
+            return flashcards
+                .Select(flashcard => new VocabularyEntry(
+                    TextNormalizer.Normalize(flashcard.Word),
+                    TextNormalizer.Normalize(flashcard.Translation)))
+                .ToList();
+        }
 
+        _page.WaitUntilElementsCountAtLeast(Selectors.PreviewVocabularyRow, 1);
         try
         {
-            var rawResult = ((IJavaScriptExecutor)_driver).ExecuteScript(
-                """
-                const rows = Array.from(document.querySelectorAll(arguments[0]));
-                const foreignSelector = arguments[1];
-                const polishSelector = arguments[2];
-
-                return JSON.stringify(rows.map(row => ({
-                    foreignWord: (row.querySelector(foreignSelector)?.innerText || '').trim(),
-                    polishTranslation: (row.querySelector(polishSelector)?.innerText || '').trim()
-                })).filter(entry => entry.foreignWord && entry.polishTranslation));
-                """,
+            var raw = _page.ExecuteScript(
+                ReadVocabularyRowsScript,
                 GetCssSelectorValue(Selectors.PreviewVocabularyRow),
                 GetCssSelectorValue(Selectors.PreviewForeignWordCell),
-                GetCssSelectorValue(Selectors.PreviewPolishWordCell));
+                GetCssSelectorValue(Selectors.PreviewPolishWordCell))?.ToString() ?? "[]";
 
-            var result = rawResult?.ToString() ?? "[]";
-            var payload = JsonSerializer.Deserialize<List<VocabularyEntryPayload>>(result, _jsonOptions) ?? [];
+            var payloads = JsonSerializer.Deserialize<List<VocabularyEntryPayload>>(raw, PageAgent.Json)
+                ?? new List<VocabularyEntryPayload>();
 
-            var entries = payload
-                .Select(entry => new VocabularyEntry(
-                    TextNormalizer.Normalize(entry.ForeignWord),
-                    TextNormalizer.Normalize(entry.PolishTranslation)))
-                .Where(entry =>
-                    !string.IsNullOrWhiteSpace(entry.ForeignWord) &&
-                    !string.IsNullOrWhiteSpace(entry.PolishTranslation))
+            var entries = payloads
+                .Select(payload => new VocabularyEntry(
+                    TextNormalizer.Normalize(payload.ForeignWord),
+                    TextNormalizer.Normalize(payload.PolishTranslation)))
+                .Where(entry => !string.IsNullOrWhiteSpace(entry.ForeignWord) && !string.IsNullOrWhiteSpace(entry.PolishTranslation))
                 .ToList();
 
             if (entries.Count > 0)
@@ -200,201 +270,22 @@ internal sealed class VocabularyCollector
 
     private List<VocabularyEntry> ScrapePreviewWithSelenium()
     {
-        var rows = WaitUntilElementsCountAtLeast(Selectors.PreviewVocabularyRow, 1);
+        var rows = _page.WaitUntilElementsCountAtLeast(Selectors.PreviewVocabularyRow, 1);
         var entries = new List<VocabularyEntry>(rows.Count);
-
         foreach (var row in rows)
         {
-            var foreignCell = FindChildElement(row, Selectors.PreviewForeignWordCell);
-            var polishCell = FindChildElement(row, Selectors.PreviewPolishWordCell);
-
-            var foreignWord = TextNormalizer.Normalize(foreignCell.Text);
-            var polishTranslation = TextNormalizer.Normalize(polishCell.Text);
-
-            if (string.IsNullOrWhiteSpace(foreignWord) || string.IsNullOrWhiteSpace(polishTranslation))
+            var foreign = TextNormalizer.Normalize(FindChildElement(row, Selectors.PreviewForeignWordCell).Text);
+            var polish = TextNormalizer.Normalize(FindChildElement(row, Selectors.PreviewPolishWordCell).Text);
+            if (!string.IsNullOrWhiteSpace(foreign) && !string.IsNullOrWhiteSpace(polish))
             {
-                continue;
+                entries.Add(new VocabularyEntry(foreign, polish));
             }
-
-            entries.Add(new VocabularyEntry(foreignWord, polishTranslation));
         }
 
         return entries;
     }
 
-    private void AddEntries(
-        Dictionary<string, List<string>> vocabulary,
-        IReadOnlyList<VocabularyEntry> entries,
-        bool logAlternatives)
-    {
-        foreach (var entry in entries)
-        {
-            var polishKey = TextNormalizer.Normalize(entry.PolishTranslation);
-            var foreignWord = TextNormalizer.Normalize(entry.ForeignWord);
-
-            if (string.IsNullOrWhiteSpace(polishKey) || string.IsNullOrWhiteSpace(foreignWord))
-            {
-                continue;
-            }
-
-            if (!vocabulary.TryGetValue(polishKey, out var candidates))
-            {
-                candidates = [];
-                vocabulary[polishKey] = candidates;
-            }
-
-            if (candidates.Any(candidate => string.Equals(candidate, foreignWord, StringComparison.OrdinalIgnoreCase)))
-            {
-                continue;
-            }
-
-            candidates.Add(foreignWord);
-
-            if (logAlternatives && candidates.Count > 1)
-            {
-                Console.WriteLine(
-                    $"Stored an alternative answer for '{entry.PolishTranslation}': {string.Join(", ", candidates)}");
-            }
-        }
-    }
-
-    private static IReadOnlyDictionary<string, IReadOnlyList<string>> ToReadOnlyVocabulary(
-        Dictionary<string, List<string>> vocabulary)
-    {
-        var readOnlyVocabulary = new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var pair in vocabulary)
-        {
-            readOnlyVocabulary[pair.Key] = pair.Value.AsReadOnly();
-        }
-
-        return readOnlyVocabulary;
-    }
-
-    private bool TryGoToNextPage(int nextPageNumber)
-    {
-        if (!Selectors.ZestawyNextPageButton.TryToBy(out var nextPageBy) || nextPageBy is null)
-        {
-            Console.WriteLine("Optional Zestawy next-page selector is not configured. Assuming there is only one page.");
-            return false;
-        }
-
-        try
-        {
-            var nextPageButton = CreateWait(_config.ShortWaitTimeout).Until(driver =>
-            {
-                try
-                {
-                    var element = driver.FindElement(nextPageBy);
-
-                    if (!element.Displayed || !element.Enabled)
-                    {
-                        return null;
-                    }
-
-                    var disabledAttribute = element.GetDomAttribute("disabled");
-                    var ariaDisabled = element.GetDomAttribute("aria-disabled");
-
-                    return string.IsNullOrWhiteSpace(disabledAttribute) &&
-                           !string.Equals(ariaDisabled, "true", StringComparison.OrdinalIgnoreCase)
-                        ? element
-                        : null;
-                }
-                catch (NoSuchElementException)
-                {
-                    return null;
-                }
-                catch (StaleElementReferenceException)
-                {
-                    return null;
-                }
-            });
-
-            if (nextPageButton is null)
-            {
-                Console.WriteLine("No active next-page button was found for Zestawy.");
-                return false;
-            }
-
-            Console.WriteLine($"Moving to Zestawy page {nextPageNumber}...");
-            ClickElement(nextPageButton);
-            WaitForDocumentReady();
-            WaitUntilElementsCountAtLeast(Selectors.SetCardContainer, 1);
-            return true;
-        }
-        catch (WebDriverTimeoutException)
-        {
-            Console.WriteLine("Reached the last Zestawy page.");
-            return false;
-        }
-    }
-
-    private IReadOnlyList<IWebElement> WaitUntilElementsCountAtLeast(SelectorDefinition selector, int minimumCount)
-    {
-        var by = selector.ToBy();
-
-        return CreateWait().Until(driver =>
-        {
-            try
-            {
-                var elements = driver.FindElements(by)
-                    .Where(element => element.Displayed)
-                    .ToList();
-
-                return elements.Count >= minimumCount ? elements : null;
-            }
-            catch (StaleElementReferenceException)
-            {
-                return null;
-            }
-        }) ?? throw new WebDriverTimeoutException(
-            $"Timed out waiting for at least {minimumCount} element(s) for selector '{selector.Name}'.");
-    }
-
-    private IWebElement WaitUntilVisible(SelectorDefinition selector)
-    {
-        var by = selector.ToBy();
-
-        return CreateWait().Until(driver =>
-        {
-            try
-            {
-                var element = driver.FindElement(by);
-                return element.Displayed ? element : null;
-            }
-            catch (NoSuchElementException)
-            {
-                return null;
-            }
-            catch (StaleElementReferenceException)
-            {
-                return null;
-            }
-        }) ?? throw new WebDriverTimeoutException($"Timed out waiting for selector '{selector.Name}' to become visible.");
-    }
-
-    private IWebElement WaitUntilClickable(SelectorDefinition selector)
-    {
-        var by = selector.ToBy();
-
-        return CreateWait().Until(driver =>
-        {
-            try
-            {
-                var element = driver.FindElement(by);
-                return element.Displayed && element.Enabled ? element : null;
-            }
-            catch (NoSuchElementException)
-            {
-                return null;
-            }
-            catch (StaleElementReferenceException)
-            {
-                return null;
-            }
-        }) ?? throw new WebDriverTimeoutException($"Timed out waiting for selector '{selector.Name}' to become clickable.");
-    }
-
-    private IWebElement FindChildElement(ISearchContext parent, SelectorDefinition selector)
+    private static IWebElement FindChildElement(ISearchContext parent, SelectorDefinition selector)
     {
         try
         {
@@ -403,66 +294,14 @@ internal sealed class VocabularyCollector
         catch (NoSuchElementException ex)
         {
             throw new InvalidOperationException(
-                $"Selector '{selector.Name}' did not match the expected child element. Verify Selectors.cs.",
-                ex);
+                $"Selector '{selector.Name}' did not match the expected child element. Verify Selectors.cs.", ex);
         }
-    }
-
-    private void WaitForDocumentReady()
-    {
-        CreateWait().Until(driver =>
-        {
-            var state = ((IJavaScriptExecutor)driver).ExecuteScript("return document.readyState");
-            return string.Equals(state?.ToString(), "complete", StringComparison.OrdinalIgnoreCase);
-        });
-    }
-
-    private void WaitForUrlContains(string pathFragment)
-    {
-        CreateWait().Until(driver =>
-        {
-            var currentUrl = driver.Url ?? string.Empty;
-            return currentUrl.Contains(pathFragment, StringComparison.OrdinalIgnoreCase);
-        });
-    }
-
-    private WebDriverWait CreateWait(TimeSpan? timeout = null)
-    {
-        var wait = new WebDriverWait(new SystemClock(), _driver, timeout ?? _config.DefaultWaitTimeout, _config.PollingInterval);
-        wait.IgnoreExceptionTypes(typeof(NoSuchElementException), typeof(StaleElementReferenceException));
-        return wait;
-    }
-
-    private void ClickElement(IWebElement element)
-    {
-        ScrollIntoView(element);
-
-        try
-        {
-            element.Click();
-        }
-        catch (ElementClickInterceptedException)
-        {
-            ((IJavaScriptExecutor)_driver).ExecuteScript("arguments[0].click();", element);
-        }
-    }
-
-    private void ScrollIntoView(IWebElement element)
-    {
-        ((IJavaScriptExecutor)_driver).ExecuteScript(
-            "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
-            element);
     }
 
     private string ToAbsoluteUrl(string urlOrPath)
-    {
-        if (Uri.TryCreate(urlOrPath, UriKind.Absolute, out var absoluteUri))
-        {
-            return absoluteUri.ToString();
-        }
-
-        return new Uri(new Uri(_config.BaseUrl), urlOrPath).ToString();
-    }
+        => Uri.TryCreate(urlOrPath, UriKind.Absolute, out var absolute)
+            ? absolute.ToString()
+            : new Uri(new Uri(_config.BaseUrl), urlOrPath).ToString();
 
     private static string GetCssSelectorValue(SelectorDefinition selector)
     {
@@ -473,8 +312,7 @@ internal sealed class VocabularyCollector
 
         if (selector.Strategy != SelectorStrategy.Css)
         {
-            throw new InvalidOperationException(
-                $"Selector '{selector.Name}' must be a CSS selector for the fast Zestawy reader.");
+            throw new InvalidOperationException($"Selector '{selector.Name}' must be a CSS selector for the fast Zestawy reader.");
         }
 
         return selector.Value;
@@ -494,5 +332,52 @@ internal sealed class VocabularyCollector
         public string ForeignWord { get; set; } = string.Empty;
 
         public string PolishTranslation { get; set; } = string.Empty;
+    }
+}
+
+/// <summary>
+/// Accumulates Polish prompt -> foreign answer pairs, keeping alternatives in the order they
+/// were seen and discarding duplicates.
+/// </summary>
+internal sealed class VocabularyBuilder
+{
+    private readonly Dictionary<string, List<string>> _answers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, HashSet<string>> _seen = new(StringComparer.OrdinalIgnoreCase);
+
+    public void Add(string polishTranslation, string foreignWord)
+    {
+        var prompt = TextNormalizer.Normalize(polishTranslation);
+        var answer = TextNormalizer.Normalize(foreignWord);
+        if (string.IsNullOrWhiteSpace(prompt) || string.IsNullOrWhiteSpace(answer))
+        {
+            return;
+        }
+
+        if (!_answers.TryGetValue(prompt, out var answers))
+        {
+            answers = new List<string>(1);
+            _answers[prompt] = answers;
+            _seen[prompt] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        if (_seen[prompt].Add(answer))
+        {
+            answers.Add(answer);
+            if (answers.Count > 1)
+            {
+                Console.WriteLine($"Stored an alternative answer for '{prompt}': {string.Join(", ", answers)}");
+            }
+        }
+    }
+
+    public IReadOnlyDictionary<string, IReadOnlyList<string>> Build()
+    {
+        var result = new Dictionary<string, IReadOnlyList<string>>(_answers.Count, StringComparer.OrdinalIgnoreCase);
+        foreach (var (prompt, answers) in _answers)
+        {
+            result[prompt] = answers.AsReadOnly();
+        }
+
+        return result;
     }
 }
