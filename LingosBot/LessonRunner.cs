@@ -166,6 +166,8 @@ internal sealed class LessonRunner
         var step = props.Step;
 
         var attempts = 0;
+        var newWordCards = 0;
+        var rejectedAnswers = 0;
         var currentIdentifier = 0L;
         var candidateIndex = 0;
 
@@ -225,6 +227,11 @@ internal sealed class LessonRunner
             }
 
             attempts++;
+            if (!string.Equals(exercise.Type, TypeFlashcard, StringComparison.Ordinal))
+            {
+                newWordCards++;
+            }
+
             var request = BuildAnswerRequest(exercise, lessonNumber, attempts, candidateIndex, out var promptText);
 
             var result = _page.PostJson<LearningAnswerResult>(answerUrl, request);
@@ -237,6 +244,7 @@ internal sealed class LessonRunner
             if (result.Feedback is { Result: <= 0 })
             {
                 candidateIndex++;
+                rejectedAnswers++;
                 ReportRejectedAnswer(promptText, request.Answer, result.Feedback, result.Step, exercise.Identifier);
             }
 
@@ -244,7 +252,10 @@ internal sealed class LessonRunner
         }
 
         throw new InvalidOperationException(
-            $"Lesson {lessonNumber} exceeded the safety cap of {_config.LessonPromptSafetyCap} prompts. Stopping to avoid an infinite loop.");
+            $"Lesson {lessonNumber} exceeded the safety cap of {_config.LessonPromptSafetyCap} prompts "
+            + $"({newWordCards} new-word cards, {rejectedAnswers} rejected answers; Lingos last reported "
+            + $"progress {step.Progress?.Current}/{step.Progress?.Total}, step '{step.State}', "
+            + $"exercise '{step.Exercise?.Type}'). Stopping to avoid an infinite loop.");
     }
 
     private LearningAnswerRequest BuildAnswerRequest(
