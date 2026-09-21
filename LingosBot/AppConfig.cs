@@ -45,7 +45,11 @@ internal sealed class AppConfig
 
     public int LessonsPerClass { get; } = 5;
 
-    public int LessonPromptSafetyCap { get; } = 30;
+    /// <summary>
+    /// Most answers one lesson may take before the bot assumes it is stuck. A lesson is about 20
+    /// exercises, plus a card for every new word and every answer Lingos asks again.
+    /// </summary>
+    public int LessonPromptSafetyCap { get; } = 100;
 
     public int ChallengeLessonSafetyCap { get; } = 40;
 }
