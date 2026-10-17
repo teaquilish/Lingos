@@ -19,7 +19,11 @@ internal static class Program
         // First run: if no login is stored yet, set one up before showing the menu.
         EnsureCredentialsExist(credentialStore);
 
-        return RunMainMenu(config, credentialStore, secondaryStore, browserFactory);
+        // Server: skip the menu and always run Modified mode (both accounts), then exit.
+        RunBotAction(config, credentialStore, browserFactory, bot => bot.RunModified(
+            secondaryStore,
+            () => PromptForCredentials(allowBack: false, "the SECOND account")!));
+        return 0;
     }
 
     private static int RunMainMenu(
