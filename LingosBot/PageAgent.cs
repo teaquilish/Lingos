@@ -67,8 +67,6 @@ internal sealed class PageAgent
         _js = (IJavaScriptExecutor)driver;
     }
 
-    public IWebDriver Driver => _driver;
-
     public AppConfig Config => _config;
 
     public string Url => _driver.Url ?? string.Empty;
@@ -313,15 +311,9 @@ internal sealed class PageAgent
 
     public bool TryFindVisible(SelectorDefinition selector, out IWebElement? element)
     {
-        element = null;
-        return selector.TryToBy(out var by) && by is not null && TryFindVisible(by, out element);
-    }
-
-    public bool TryFindVisible(By by, out IWebElement? element)
-    {
         try
         {
-            element = _driver.FindElement(by);
+            element = _driver.FindElement(selector.ToBy());
             return element.Displayed;
         }
         catch (NoSuchElementException)
@@ -387,33 +379,6 @@ internal sealed class PageAgent
         }
     }
 
-    public IReadOnlyList<IWebElement> WaitUntilElementsCountAtLeast(SelectorDefinition selector, int minimumCount)
-    {
-        var by = selector.ToBy();
-        var wait = Wait();
-        try
-        {
-            return wait.Until(driver =>
-            {
-                try
-                {
-                    var visible = driver.FindElements(by).Where(element => element.Displayed).ToList();
-                    return visible.Count >= minimumCount ? visible : null;
-                }
-                catch (StaleElementReferenceException)
-                {
-                    return null;
-                }
-            })!;
-        }
-        catch (WebDriverTimeoutException ex)
-        {
-            throw new WebDriverTimeoutException(
-                $"Timed out after {Seconds(wait.Timeout)} waiting for at least {minimumCount} visible {selector.Name} "
-                + $"({selector.Value}) at {Url}: {DescribeElementProblem(by, requireEnabled: false)}", ex);
-        }
-    }
-
     /// <summary>Says whether a selector that timed out is missing, hidden or disabled on the open page.</summary>
     private string DescribeElementProblem(By by, bool requireEnabled)
     {
@@ -438,7 +403,7 @@ internal sealed class PageAgent
 
             return requireEnabled && !visible.Any(element => element.Enabled)
                 ? "it is on the page but disabled."
-                : $"only {visible.Count} visible element(s) match.";
+                : "it is on the page now, so it probably appeared just after the wait ended.";
         }
         catch (WebDriverException ex)
         {
@@ -459,7 +424,7 @@ internal sealed class PageAgent
         }
     }
 
-    public void ScrollIntoView(IWebElement element)
+    private void ScrollIntoView(IWebElement element)
         => _js.ExecuteScript("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", element);
 
     // ---- waiting ----------------------------------------------------------
@@ -499,8 +464,6 @@ internal sealed class PageAgent
         wait.IgnoreExceptionTypes(typeof(NoSuchElementException), typeof(StaleElementReferenceException));
         return wait;
     }
-
-    public object? ExecuteScript(string script, params object[] args) => _js.ExecuteScript(script, args);
 }
 
 /// <summary>

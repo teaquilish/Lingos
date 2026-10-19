@@ -1,5 +1,3 @@
-using OpenQA.Selenium;
-
 namespace LingosBotApp;
 
 /// <summary>
@@ -9,11 +7,6 @@ internal sealed class ClassSwitcher
 {
     private readonly PageAgent _page;
     private readonly AppConfig _config;
-
-    public ClassSwitcher(IWebDriver driver, AppConfig config)
-        : this(new PageAgent(driver, config))
-    {
-    }
 
     public ClassSwitcher(PageAgent page)
     {

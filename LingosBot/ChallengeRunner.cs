@@ -1,5 +1,4 @@
 using System.Globalization;
-using OpenQA.Selenium;
 
 namespace LingosBotApp;
 
@@ -10,11 +9,6 @@ internal sealed class ChallengeRunner
 {
     private readonly PageAgent _page;
     private readonly AppConfig _config;
-
-    public ChallengeRunner(IWebDriver driver, AppConfig config)
-        : this(new PageAgent(driver, config))
-    {
-    }
 
     public ChallengeRunner(PageAgent page)
     {

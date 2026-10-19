@@ -5,6 +5,8 @@ namespace LingosBotApp;
 
 internal sealed class LingosBot
 {
+    private const string CurrentClassName = "current class";
+
     private readonly AppConfig _config;
     private readonly BrowserFactory _browserFactory;
     private readonly CredentialStore _credentialStore;
@@ -12,6 +14,9 @@ internal sealed class LingosBot
 
     /// <summary>What the bot is doing right now, so an error can say where it happened.</summary>
     private string _step = "starting";
+
+    /// <summary>Lessons finished for the account being run, reported when the daily limit stops it.</summary>
+    private int _completedLessons;
 
     public LingosBot(
         AppConfig config,
@@ -25,93 +30,51 @@ internal sealed class LingosBot
         _credentialPrompt = credentialPrompt;
     }
 
+    /// <summary>The <c>[number]</c> menu option: that many lessons on the class that is already selected.</summary>
     public void Run(int lessonCount)
     {
-        var initialCredentials = ResolveCredentials(_credentialStore, _credentialPrompt);
-        var completed = 0;
-        IWebDriver? driver = null;
-
-        try
+        RunAccount(_credentialStore, _credentialPrompt, "your account", (page, _) =>
         {
-            Console.WriteLine("Starting Google Chrome...");
-            _step = "starting Chrome";
-            driver = _browserFactory.Create(_config);
-            var page = new PageAgent(driver, _config);
-
-            var total = Stopwatch.StartNew();
-            _step = "logging in";
-            LoginWithRetry(new LoginService(page), initialCredentials, _credentialStore, _credentialPrompt);
-
-            var collecting = Stopwatch.StartNew();
-            _step = "collecting vocabulary";
-            var vocabulary = new VocabularyCollector(page).CollectVocabulary();
-            collecting.Stop();
-
-            if (vocabulary.Count == 0)
-            {
-                throw new InvalidOperationException(
-                    "No vocabulary was collected from Zestawy. The messages above say what went wrong with each wordset.");
-            }
-
-            var answerCount = vocabulary.Sum(pair => pair.Value.Count);
-            Console.WriteLine(
-                $"Collected {vocabulary.Count} unique Polish prompts with {answerCount} stored answer candidates in {collecting.Elapsed:mm\\:ss}.");
-
-            var lessonRunner = new LessonRunner(page, vocabulary);
-            var challengeRunner = new ChallengeRunner(page);
-
-            for (var lesson = 1; lesson <= lessonCount; lesson++)
-            {
-                _step = $"checking challenges before lesson {lesson}";
-                EnsureChallengeSelected(challengeRunner);
-                var elapsed = Stopwatch.StartNew();
-                _step = $"running lesson {lesson}";
-                lessonRunner.RunLesson(lesson);
-                elapsed.Stop();
-                Console.WriteLine($"Lesson {lesson} elapsed time: {elapsed.Elapsed:mm\\:ss}.");
-                completed++;
-            }
-
-            total.Stop();
-            Console.WriteLine($"Total run time: {total.Elapsed:mm\\:ss}.");
+            RunLessons(page, lessonCount, CurrentClassName);
             Console.WriteLine("All requested lessons were completed.");
-        }
-        catch (LessonLimitReachedException ex)
-        {
-            Console.WriteLine($"{ex.Message} Completed lessons in this run: {completed}.");
-        }
-        catch (Exception ex) when (driver is not null)
-        {
-            Console.WriteLine($"Failed while {_step}.");
-            SaveDiagnostics(driver, ex, _step);
-            throw;
-        }
-        finally
-        {
-            CloseBrowser(driver, "Closing Chrome...");
-        }
+        });
     }
 
     public void RunUsual()
     {
         Console.WriteLine("=== Usual mode: your account, all classes ===");
-        RunAllClassesForAccount(_credentialStore, _credentialPrompt, "your account");
+        RunEveryClassForAccount(_credentialStore, _credentialPrompt, "your account");
     }
 
     public void RunModified(CredentialStore secondaryStore, Func<AppCredentials> secondaryPrompt)
     {
         Console.WriteLine("=== Modified mode: account 1 of 2 ===");
-        RunAllClassesForAccount(_credentialStore, _credentialPrompt, "account 1");
+        RunEveryClassForAccount(_credentialStore, _credentialPrompt, "account 1");
         Console.WriteLine();
         Console.WriteLine("=== Modified mode: account 2 of 2 ===");
-        RunAllClassesForAccount(secondaryStore, secondaryPrompt, "account 2");
+        RunEveryClassForAccount(secondaryStore, secondaryPrompt, "account 2");
         Console.WriteLine();
         Console.WriteLine("Modified mode finished (both accounts).");
     }
 
-    private void RunAllClassesForAccount(CredentialStore store, Func<AppCredentials> prompt, string label)
+    private void RunEveryClassForAccount(CredentialStore store, Func<AppCredentials> prompt, string label)
+        => RunAccount(store, prompt, label, (page, credentials) => RunEveryClass(page, credentials, label));
+
+    /// <summary>
+    /// Starts Chrome, signs in to one account and hands the signed-in page to <paramref name="work"/>.
+    /// Every menu option goes through here, so they all stop on the daily limit, report errors and
+    /// save diagnostics the same way. An error ends this account only, so Modified mode still moves
+    /// on to the second account.
+    /// </summary>
+    private void RunAccount(
+        CredentialStore store,
+        Func<AppCredentials> prompt,
+        string label,
+        Action<PageAgent, AppCredentials> work)
     {
         var credentials = ResolveCredentials(store, prompt);
+        var total = Stopwatch.StartNew();
+        _completedLessons = 0;
         IWebDriver? driver = null;
 
         try
@@ -122,38 +85,13 @@ internal sealed class LingosBot
             var page = new PageAgent(driver, _config);
 
             _step = $"logging in to {label}";
-            LoginWithRetry(new LoginService(page), credentials, store, prompt);
+            credentials = LoginWithRetry(new LoginService(page), credentials, store, prompt);
 
-            _step = "reading the class list";
-            var classSwitcher = new ClassSwitcher(page);
-            var classes = classSwitcher.ReadClasses();
-
-            if (classes.Count == 0)
-            {
-                Console.WriteLine("Lingos listed no classes for this account (it may be on a premium course) - "
-                    + "running lessons on whatever is selected.");
-                RunLessonsOnCurrentClass(page, _config.LessonsPerClass, "current class");
-            }
-            else
-            {
-                Console.WriteLine($"Found {classes.Count} class(es) for {credentials.Email}.");
-                var index = 0;
-                foreach (var lessonClass in classes)
-                {
-                    index++;
-                    Console.WriteLine();
-                    Console.WriteLine($"--- Class {index}/{classes.Count}: {lessonClass.Name} ---");
-                    _step = $"switching to class '{lessonClass.Name}'";
-                    classSwitcher.SwitchTo(lessonClass);
-                    RunLessonsOnCurrentClass(page, _config.LessonsPerClass, lessonClass.Name);
-                }
-            }
-
-            Console.WriteLine($"Finished all classes for {label}.");
+            work(page, credentials);
         }
         catch (LessonLimitReachedException ex)
         {
-            Console.WriteLine($"{ex.Message} Stopping {label}.");
+            Console.WriteLine($"{ex.Message} Stopping {label} after {_completedLessons} lesson(s) in this run.");
         }
         catch (Exception ex) when (driver is not null)
         {
@@ -162,19 +100,59 @@ internal sealed class LingosBot
         }
         finally
         {
-            CloseBrowser(driver, $"Closing Chrome for {label}...");
+            if (driver is not null)
+            {
+                CloseBrowser(driver, $"Closing Chrome for {label}...");
+                Console.WriteLine($"Total run time for {label}: {total.Elapsed:mm\\:ss}.");
+            }
         }
     }
 
-    private void RunLessonsOnCurrentClass(PageAgent page, int lessonCount, string className)
+    private void RunEveryClass(PageAgent page, AppCredentials credentials, string label)
+    {
+        _step = "reading the class list";
+        var classSwitcher = new ClassSwitcher(page);
+        var classes = classSwitcher.ReadClasses();
+
+        if (classes.Count == 0)
+        {
+            Console.WriteLine("Lingos listed no classes for this account (it may be on a premium course) - "
+                + "running lessons on whatever is selected.");
+            RunLessons(page, _config.LessonsPerClass, CurrentClassName);
+        }
+        else
+        {
+            Console.WriteLine($"Found {classes.Count} class(es) for {credentials.Email}.");
+            var index = 0;
+            foreach (var lessonClass in classes)
+            {
+                index++;
+                Console.WriteLine();
+                Console.WriteLine($"--- Class {index}/{classes.Count}: {lessonClass.Name} ---");
+                _step = $"switching to class '{lessonClass.Name}'";
+                classSwitcher.SwitchTo(lessonClass);
+                RunLessons(page, _config.LessonsPerClass, lessonClass.Name);
+            }
+        }
+
+        Console.WriteLine($"Finished all classes for {label}.");
+    }
+
+    /// <summary>Collects the selected class's vocabulary, then runs <paramref name="lessonCount"/> lessons on it.</summary>
+    private void RunLessons(PageAgent page, int lessonCount, string className)
     {
         _step = $"collecting vocabulary for '{className}'";
+        var collecting = Stopwatch.StartNew();
         var vocabulary = new VocabularyCollector(page).CollectVocabulary();
         if (vocabulary.Count == 0)
         {
-            Console.WriteLine($"No vocabulary found for '{className}' - skipping it. The messages above say why.");
+            Console.WriteLine($"No vocabulary found for '{className}' - skipping it.");
             return;
         }
+
+        var answerCount = vocabulary.Sum(pair => pair.Value.Count);
+        Console.WriteLine(
+            $"Collected {vocabulary.Count} unique Polish prompts with {answerCount} stored answer candidates in {collecting.Elapsed:mm\\:ss}.");
 
         var lessonRunner = new LessonRunner(page, vocabulary);
         var challengeRunner = new ChallengeRunner(page);
@@ -183,9 +161,12 @@ internal sealed class LingosBot
         {
             _step = $"checking challenges before lesson {lesson} on '{className}'";
             EnsureChallengeSelected(challengeRunner);
+
             _step = $"running lesson {lesson} on '{className}'";
+            var elapsed = Stopwatch.StartNew();
             lessonRunner.RunLesson(lesson);
-            Console.WriteLine($"  [{className}] lesson {lesson}/{lessonCount} done.");
+            _completedLessons++;
+            Console.WriteLine($"  [{className}] lesson {lesson}/{lessonCount} done in {elapsed.Elapsed:mm\\:ss}.");
         }
     }
 
@@ -217,13 +198,8 @@ internal sealed class LingosBot
         }
     }
 
-    private static void CloseBrowser(IWebDriver? driver, string message)
+    private static void CloseBrowser(IWebDriver driver, string message)
     {
-        if (driver is null)
-        {
-            return;
-        }
-
         Console.WriteLine(message);
         try
         {
@@ -277,7 +253,8 @@ internal sealed class LingosBot
         return prompt();
     }
 
-    private static void LoginWithRetry(
+    /// <summary>Logs in, asking once for new credentials if the saved ones fail. Returns the ones that worked.</summary>
+    private static AppCredentials LoginWithRetry(
         LoginService loginService,
         AppCredentials initialCredentials,
         CredentialStore store,
@@ -292,7 +269,7 @@ internal sealed class LingosBot
             {
                 loginService.Login(credentials);
                 store.Save(credentials);
-                return;
+                return credentials;
             }
             catch (LoginFailedException ex) when (!retried)
             {
