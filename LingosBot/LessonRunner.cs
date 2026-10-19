@@ -15,6 +15,8 @@ internal sealed class LessonRunner
     private const string StateChangeWordset = "change_wordset";
     private const string StateSelectLevel = "select_level";
     private const string TypeFlashcard = "flashcard";
+    private const string TypeNewTeacher = "new_teacher";
+    private const string TypeNewPremium = "new_premium";
     private const string StatusOk = "ok";
     private const string ReasonLimitExceeded = "limit-exceeded";
 
@@ -100,6 +102,7 @@ internal sealed class LessonRunner
     private LearningProps StartLesson()
     {
         Console.WriteLine("Starting a lesson from the main page...");
+        var lastProblem = "Lingos did not open a lesson.";
         for (var attempt = 1; attempt <= 3; attempt++)
         {
             try
@@ -113,19 +116,21 @@ internal sealed class LessonRunner
                 {
                     return props;
                 }
+
+                lastProblem = $"the lesson page reported status '{props.Status}' but no first exercise.";
             }
-            catch (WebDriverTimeoutException) when (attempt < 3)
+            catch (WebDriverTimeoutException ex) when (attempt < 3)
             {
+                lastProblem = ex.Message;
             }
 
-            Console.WriteLine("Lingos did not open a lesson on that click. Retrying...");
+            Console.WriteLine($"Lingos did not open a lesson on that click ({lastProblem}) Retrying...");
             _page.GoTo(_config.StudentDashboardUrl);
             _page.WaitForDocumentReady();
             ThrowIfDailyLimitReached();
         }
 
-        throw new WebDriverTimeoutException(
-            "Timed out while entering the lesson. Lingos did not show a prompt, continue step, or lesson-limit message.");
+        throw new WebDriverTimeoutException($"Could not enter a lesson after 3 tries. Last problem: {lastProblem}");
     }
 
     private LearningProps ReadLearningProps() => _page.ReadPropsWhenReady<LearningProps>("the lesson");
@@ -145,9 +150,21 @@ internal sealed class LessonRunner
 
         if (!string.IsNullOrWhiteSpace(props.Reason))
         {
-            throw new InvalidOperationException($"Lingos refused to start a lesson ({props.Reason}).");
+            throw new InvalidOperationException(
+                $"Lingos refused to start a lesson: {DescribeRefusal(props.Reason)} ('{props.Reason}').");
         }
     }
+
+    /// <summary>The reasons the lesson page can give for refusing to start, as the site itself explains them.</summary>
+    private static string DescribeRefusal(string reason) => reason switch
+    {
+        "no-premium-access" => "this needs a Lingos Premium account",
+        "incorrect-group-selected" => "the selected class is not available to this account",
+        "no-group-available" => "this account is not in any class",
+        "no-wordset-access" => "this account has no access to the selected wordset",
+        "not-enough-words" => "the teacher has assigned fewer than 20 words to this class",
+        _ => "a reason the bot does not know yet"
+    };
 
     // ---- fast path: the site's own answer endpoint ------------------------
 
@@ -183,6 +200,7 @@ internal sealed class LessonRunner
                 {
                     if (string.IsNullOrWhiteSpace(step.ContinueUrl))
                     {
+                        Console.WriteLine("Lingos asked to move on to another wordset but gave no address to continue at.");
                         return false;
                     }
 
@@ -193,6 +211,7 @@ internal sealed class LessonRunner
                     ThrowIfLessonBlocked(continued);
                     if (!string.Equals(continued.Status, StatusOk, StringComparison.Ordinal) || continued.Step is null)
                     {
+                        Console.WriteLine($"The next wordset reported status '{continued.Status}' but no exercise.");
                         return false;
                     }
 
@@ -210,13 +229,15 @@ internal sealed class LessonRunner
                     break;
 
                 default:
-                    Console.WriteLine($"Lingos returned an unfamiliar lesson step ('{step.State}').");
+                    Console.WriteLine($"Lingos returned an unfamiliar lesson step ('{step.State}'), so it has probably "
+                        + "changed how lessons work.");
                     return false;
             }
 
             var exercise = step.Exercise;
             if (exercise is null)
             {
+                Console.WriteLine("Lingos returned an exercise step without the exercise itself.");
                 return false;
             }
 
@@ -234,10 +255,13 @@ internal sealed class LessonRunner
 
             var request = BuildAnswerRequest(exercise, lessonNumber, attempts, candidateIndex, out var promptText);
 
-            var result = _page.PostJson<LearningAnswerResult>(answerUrl, request);
+            var response = _page.PostJson<LearningAnswerResult>(answerUrl, request);
+            var result = response.Value;
             if (result?.Step is null)
             {
-                Console.WriteLine("The lesson answer request did not go through.");
+                Console.WriteLine(result is null
+                    ? $"The lesson answer request did not go through: {response.Failure}"
+                    : "Lingos accepted the answer but did not say what comes next.");
                 return false;
             }
 
@@ -270,13 +294,20 @@ internal sealed class LessonRunner
         // "new_teacher" and "new_premium" only present a word; they are acknowledged, not answered.
         if (!string.Equals(exercise.Type, TypeFlashcard, StringComparison.Ordinal))
         {
+            if (!string.Equals(exercise.Type, TypeNewTeacher, StringComparison.Ordinal)
+                && !string.Equals(exercise.Type, TypeNewPremium, StringComparison.Ordinal))
+            {
+                Console.WriteLine($"Lingos sent an unfamiliar exercise type '{exercise.Type}'. Treating it as a new-word card.");
+            }
+
             Console.WriteLine($"[Lesson {lessonNumber} · word {promptIndex}] new word: {TextNormalizer.Normalize(exercise.Translation)}");
             return new LearningAnswerRequest { Identifier = exercise.Identifier, Answer = string.Empty, Skip = false };
         }
 
         if (string.IsNullOrWhiteSpace(promptText))
         {
-            throw new InvalidOperationException("The lesson prompt text was empty. Verify the lesson prompt selector in Selectors.cs.");
+            throw new InvalidOperationException(
+                $"Lingos sent a flashcard with an empty prompt (exercise {exercise.Identifier}), so the lesson data has probably changed.");
         }
 
         var candidates = ResolveCandidateAnswers(promptText);

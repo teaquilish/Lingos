@@ -44,7 +44,8 @@ internal sealed class LoginService
         catch (WebDriverTimeoutException ex)
         {
             throw new LoginFailedException(
-                "Login failed. Check your credentials and update the login selectors in Selectors.cs if the website layout changed.",
+                $"Login did not go through: after submitting the form the browser stayed at {_page.Url}. Usually the email or "
+                + "password is wrong; if they are right, Lingos may have changed its login page (see Selectors.cs).",
                 ex);
         }
     }

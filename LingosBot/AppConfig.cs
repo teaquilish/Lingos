@@ -21,7 +21,8 @@ internal sealed class AppConfig
     /// <summary>Endpoint that joins a challenge; <c>{0}</c> is the challenge id.</summary>
     public string ChallengeJoinPathFormat { get; } = "/student/challenges/{0}";
 
-    public string GroupSwitchPath { get; } = "/student/group";
+    /// <summary>Endpoint that selects the class (or course) the dashboard and lessons use.</summary>
+    public string ContextSwitchPath { get; } = "/student/context";
 
     public string CredentialFilePath { get; } = Path.Combine(AppContext.BaseDirectory, "credentials.json");
 

@@ -85,10 +85,15 @@ internal sealed class VocabularyCollector
     /// </summary>
     private bool TryCollectFromPageData(VocabularyBuilder builder)
     {
-        var wordsets = _page.ReadProps<StudentProps>()?.Wordsets?.Wordsets;
+        var props = _page.ReadProps<StudentProps>();
+        var wordsets = props?.Wordsets?.Wordsets;
         if (wordsets is null || wordsets.Count == 0)
         {
-            Console.WriteLine("Could not read the wordset list from the page data. Falling back to reading the page itself.");
+            var reason = props is null ? _page.DescribePageDataProblem<StudentProps>()
+                : props.Wordsets is null ? $"the page data has no wordset list (page '{props.Page}'). It may be a premium course, "
+                    + "or Lingos has changed the Zestawy page."
+                : "the class has no wordsets.";
+            Console.WriteLine($"Could not read the wordset list from the page data: {reason} Falling back to reading the page itself.");
             return false;
         }
 
@@ -98,7 +103,7 @@ internal sealed class VocabularyCollector
             .Select(wordset => string.Format(CultureInfo.InvariantCulture, _config.WordsetPathFormat, wordset.Id))
             .ToList();
 
-        List<StudentProps?> pages;
+        List<EndpointResult<StudentProps>> pages;
         try
         {
             pages = _page.FetchProps<StudentProps>(urls);
@@ -113,10 +118,13 @@ internal sealed class VocabularyCollector
         for (var i = 0; i < wordsets.Count; i++)
         {
             var wordset = wordsets[i];
-            var flashcards = i < pages.Count ? pages[i]?.Wordset?.Flashcards : null;
+            var page = pages[i];
+            var flashcards = page.Value?.Wordset?.Flashcards;
             if (flashcards is null)
             {
-                Console.WriteLine($"Could not read wordset {i + 1}/{wordsets.Count}: {wordset.Name}.");
+                var reason = page.Value is null ? page.Failure
+                    : $"its page data has no flashcard list (page '{page.Value.Page}'), so Lingos has probably changed the wordset page.";
+                Console.WriteLine($"Could not read wordset {i + 1}/{wordsets.Count}: {wordset.Name}. {reason}");
                 continue;
             }
 

@@ -41,7 +41,18 @@ internal sealed class BrowserFactory
             Console.WriteLine($"Using Chrome binary from LINGOS_CHROME_BINARY: {config.ChromeBinaryPath}");
         }
 
-        var driver = new ChromeDriver(chromeService, chromeOptions);
+        ChromeDriver driver;
+        try
+        {
+            driver = new ChromeDriver(chromeService, chromeOptions);
+        }
+        catch (WebDriverException ex)
+        {
+            throw new InvalidOperationException(
+                "Could not start Chrome. The first run downloads Chrome through Selenium Manager, so check the internet "
+                + $"connection, or point LINGOS_CHROME_BINARY at an installed Chrome. Selenium said: {ex.Message}", ex);
+        }
+
         driver.Manage().Timeouts().PageLoad = config.PageLoadTimeout;
         driver.Manage().Timeouts().ImplicitWait = TimeSpan.Zero;
         driver.Manage().Timeouts().AsynchronousJavaScript = config.ScriptTimeout;

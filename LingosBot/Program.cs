@@ -98,7 +98,8 @@ internal static class Program
         {
             Console.WriteLine();
             Console.WriteLine($"Something went wrong: {ex.Message}");
-            Console.WriteLine("If no browser window was visible, check the 'diagnostics' folder for a saved screenshot.");
+            Console.WriteLine(
+                $"If Chrome had started, the full error, the page and a screenshot are in {Path.Combine(AppContext.BaseDirectory, "diagnostics")}.");
         }
     }
 
