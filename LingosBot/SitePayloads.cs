@@ -182,7 +182,15 @@ internal sealed class LearningAnswerRequest
     public bool Skip { get; set; }
 }
 
-internal sealed class GroupSwitchRequest
+/// <summary>
+/// Body of <c>POST /student/context</c>. Lingos calls the class or course a student is working in
+/// a "context"; <c>kind</c> is <c>group</c> for a teacher's class and <c>premium</c> for a course.
+/// </summary>
+internal sealed class ContextSwitchRequest
 {
-    public int GroupId { get; set; }
+    public const string KindGroup = "group";
+
+    public string Kind { get; set; } = KindGroup;
+
+    public int Id { get; set; }
 }

@@ -36,9 +36,12 @@ internal sealed class ClassSwitcher
 
     public void SwitchTo(ClassInfo lessonClass)
     {
-        if (_page.PostJson<StudentProps>(_config.GroupSwitchPath, new GroupSwitchRequest { GroupId = lessonClass.Id }) is null)
+        var request = new ContextSwitchRequest { Kind = ContextSwitchRequest.KindGroup, Id = lessonClass.Id };
+        var result = _page.PostJson<DashboardProps>(_config.ContextSwitchPath, request);
+        if (result.Value is null)
         {
-            throw new InvalidOperationException($"Lingos did not accept switching to the class '{lessonClass.Name}'.");
+            throw new InvalidOperationException(
+                $"Lingos did not accept switching to the class '{lessonClass.Name}' (id {lessonClass.Id}): {result.Failure}");
         }
 
         // The dashboard was updated in place by the request above; reload it so the page markup

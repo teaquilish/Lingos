@@ -10,6 +10,9 @@ internal sealed class LingosBot
     private readonly CredentialStore _credentialStore;
     private readonly Func<AppCredentials> _credentialPrompt;
 
+    /// <summary>What the bot is doing right now, so an error can say where it happened.</summary>
+    private string _step = "starting";
+
     public LingosBot(
         AppConfig config,
         BrowserFactory browserFactory,
@@ -31,19 +34,23 @@ internal sealed class LingosBot
         try
         {
             Console.WriteLine("Starting Google Chrome...");
+            _step = "starting Chrome";
             driver = _browserFactory.Create(_config);
             var page = new PageAgent(driver, _config);
 
             var total = Stopwatch.StartNew();
+            _step = "logging in";
             LoginWithRetry(new LoginService(page), initialCredentials, _credentialStore, _credentialPrompt);
 
             var collecting = Stopwatch.StartNew();
+            _step = "collecting vocabulary";
             var vocabulary = new VocabularyCollector(page).CollectVocabulary();
             collecting.Stop();
 
             if (vocabulary.Count == 0)
             {
-                throw new InvalidOperationException("No vocabulary was collected from Zestawy. Verify the selectors in Selectors.cs.");
+                throw new InvalidOperationException(
+                    "No vocabulary was collected from Zestawy. The messages above say what went wrong with each wordset.");
             }
 
             var answerCount = vocabulary.Sum(pair => pair.Value.Count);
@@ -55,8 +62,10 @@ internal sealed class LingosBot
 
             for (var lesson = 1; lesson <= lessonCount; lesson++)
             {
+                _step = $"checking challenges before lesson {lesson}";
                 EnsureChallengeSelected(challengeRunner);
                 var elapsed = Stopwatch.StartNew();
+                _step = $"running lesson {lesson}";
                 lessonRunner.RunLesson(lesson);
                 elapsed.Stop();
                 Console.WriteLine($"Lesson {lesson} elapsed time: {elapsed.Elapsed:mm\\:ss}.");
@@ -73,7 +82,8 @@ internal sealed class LingosBot
         }
         catch (Exception ex) when (driver is not null)
         {
-            SaveDiagnostics(driver, ex);
+            Console.WriteLine($"Failed while {_step}.");
+            SaveDiagnostics(driver, ex, _step);
             throw;
         }
         finally
@@ -107,17 +117,21 @@ internal sealed class LingosBot
         try
         {
             Console.WriteLine($"Starting Google Chrome for {label}...");
+            _step = $"starting Chrome for {label}";
             driver = _browserFactory.Create(_config);
             var page = new PageAgent(driver, _config);
 
+            _step = $"logging in to {label}";
             LoginWithRetry(new LoginService(page), credentials, store, prompt);
 
+            _step = "reading the class list";
             var classSwitcher = new ClassSwitcher(page);
             var classes = classSwitcher.ReadClasses();
 
             if (classes.Count == 0)
             {
-                Console.WriteLine("No class switcher found - running lessons on the current class only.");
+                Console.WriteLine("Lingos listed no classes for this account (it may be on a premium course) - "
+                    + "running lessons on whatever is selected.");
                 RunLessonsOnCurrentClass(page, _config.LessonsPerClass, "current class");
             }
             else
@@ -129,6 +143,7 @@ internal sealed class LingosBot
                     index++;
                     Console.WriteLine();
                     Console.WriteLine($"--- Class {index}/{classes.Count}: {lessonClass.Name} ---");
+                    _step = $"switching to class '{lessonClass.Name}'";
                     classSwitcher.SwitchTo(lessonClass);
                     RunLessonsOnCurrentClass(page, _config.LessonsPerClass, lessonClass.Name);
                 }
@@ -142,8 +157,8 @@ internal sealed class LingosBot
         }
         catch (Exception ex) when (driver is not null)
         {
-            SaveDiagnostics(driver, ex);
-            Console.WriteLine($"Error during {label}: {ex.Message}");
+            Console.WriteLine($"Error during {label} while {_step}: {ex.Message}");
+            SaveDiagnostics(driver, ex, _step);
         }
         finally
         {
@@ -153,10 +168,11 @@ internal sealed class LingosBot
 
     private void RunLessonsOnCurrentClass(PageAgent page, int lessonCount, string className)
     {
+        _step = $"collecting vocabulary for '{className}'";
         var vocabulary = new VocabularyCollector(page).CollectVocabulary();
         if (vocabulary.Count == 0)
         {
-            Console.WriteLine($"No vocabulary found for '{className}' - skipping it.");
+            Console.WriteLine($"No vocabulary found for '{className}' - skipping it. The messages above say why.");
             return;
         }
 
@@ -165,7 +181,9 @@ internal sealed class LingosBot
 
         for (var lesson = 1; lesson <= lessonCount; lesson++)
         {
+            _step = $"checking challenges before lesson {lesson} on '{className}'";
             EnsureChallengeSelected(challengeRunner);
+            _step = $"running lesson {lesson} on '{className}'";
             lessonRunner.RunLesson(lesson);
             Console.WriteLine($"  [{className}] lesson {lesson}/{lessonCount} done.");
         }
@@ -218,13 +236,20 @@ internal sealed class LingosBot
         }
     }
 
-    private static void SaveDiagnostics(IWebDriver driver, Exception exception)
+    private static void SaveDiagnostics(IWebDriver driver, Exception exception, string step)
     {
         try
         {
             var folder = Path.Combine(AppContext.BaseDirectory, "diagnostics");
             Directory.CreateDirectory(folder);
             var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+            var errorFile = Path.Combine(folder, $"error-{stamp}.txt");
+
+            // The error file goes first: it is the most useful part, and the page or screenshot can fail.
+            File.WriteAllText(
+                errorFile,
+                $"Timestamp: {DateTime.Now:O}{Environment.NewLine}Step: {step}{Environment.NewLine}"
+                + $"Url: {driver.Url}{Environment.NewLine}Error: {exception}");
 
             File.WriteAllText(Path.Combine(folder, $"page-{stamp}.html"), driver.PageSource);
             if (driver is ITakesScreenshot screenshotTaker)
@@ -232,11 +257,7 @@ internal sealed class LingosBot
                 screenshotTaker.GetScreenshot().SaveAsFile(Path.Combine(folder, $"page-{stamp}.png"));
             }
 
-            File.WriteAllText(
-                Path.Combine(folder, $"error-{stamp}.txt"),
-                $"Timestamp: {DateTime.Now:O}{Environment.NewLine}Url: {driver.Url}{Environment.NewLine}Error: {exception}");
-
-            Console.WriteLine($"Diagnostics saved to: {folder}");
+            Console.WriteLine($"Diagnostics (error, page and screenshot) saved to: {errorFile}");
         }
         catch (Exception ex)
         {

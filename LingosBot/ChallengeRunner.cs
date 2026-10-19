@@ -44,9 +44,10 @@ internal sealed class ChallengeRunner
     public void Join(ChallengeInfo challenge)
     {
         var url = string.Format(CultureInfo.InvariantCulture, _config.ChallengeJoinPathFormat, challenge.Id);
-        if (_page.PostJson<StudentProps>(url, null) is null)
+        var result = _page.PostJson<DashboardProps>(url, null);
+        if (result.Value is null)
         {
-            throw new InvalidOperationException($"Lingos did not accept joining the challenge '{challenge.Title}'.");
+            throw new InvalidOperationException($"Lingos did not accept joining the challenge '{challenge.Title}': {result.Failure}");
         }
     }
 }
