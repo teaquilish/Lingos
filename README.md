@@ -45,7 +45,8 @@ Chrome runs **headless** (no window) and **muted**, and each word is streamed to
 
 - Reads every wordset in the current class and builds a Polish prompt to foreign answer lookup, fresh on each run.
 - Answers only from what it collected. If a prompt has no stored translation it stops rather than guessing.
-- Talks to the site the same way the site's own scripts do: page state comes from the JSON lingos.pl renders into `#app[data-props]`, and answers go through its `POST /learning/answer/{lessonId}` endpoint. CSS selectors are kept as a fallback for when that isn't available.
+- Talks to the site the same way the site's own scripts do: page state comes from the JSON lingos.pl renders into `#app[data-props]`, and answers go through its `POST /learning/answer/{lessonId}` endpoint. CSS selectors are only used to log in and move around the site.
+- If lingos.pl changes something the bot relies on, it stops and says what changed (and which step it was on) instead of guessing.
 - Free accounts have a daily lesson cap. When it is reached the bot reports it and stops cleanly instead of hanging.
 
 ## Notes

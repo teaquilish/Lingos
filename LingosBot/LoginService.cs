@@ -7,11 +7,6 @@ internal sealed class LoginService
     private readonly PageAgent _page;
     private readonly AppConfig _config;
 
-    public LoginService(IWebDriver driver, AppConfig config)
-        : this(new PageAgent(driver, config))
-    {
-    }
-
     public LoginService(PageAgent page)
     {
         _page = page;

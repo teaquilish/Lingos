@@ -51,8 +51,6 @@ internal sealed class AppConfig
     /// exercises, plus a card for every new word and every answer Lingos asks again.
     /// </summary>
     public int LessonPromptSafetyCap { get; } = 100;
-
-    public int ChallengeLessonSafetyCap { get; } = 40;
 }
 
 internal static class TextNormalizer

@@ -5,8 +5,7 @@ namespace LingosBotApp;
 
 /// <summary>
 /// Runs one lesson at a time: open the dashboard, start a lesson, then answer each prompt from
-/// the collected vocabulary. Prompts are answered through the site's own answer endpoint, with
-/// a fallback that types into the page when that endpoint cannot be used.
+/// the collected vocabulary through the site's own answer endpoint.
 /// </summary>
 internal sealed class LessonRunner
 {
@@ -20,31 +19,10 @@ internal sealed class LessonRunner
     private const string StatusOk = "ok";
     private const string ReasonLimitExceeded = "limit-exceeded";
 
-    private const string PopulateAnswerScript = """
-        const input = arguments[0];
-        const value = arguments[1];
-        const descriptor =
-            Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input), 'value') ||
-            Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
-        if (!descriptor || typeof descriptor.set !== 'function') { return false; }
-        input.focus();
-        descriptor.set.call(input, '');
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        descriptor.set.call(input, value);
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-        return true;
-        """;
-
     private readonly PageAgent _page;
     private readonly AppConfig _config;
     private readonly IReadOnlyDictionary<string, IReadOnlyList<string>> _vocabulary;
     private readonly IReadOnlyDictionary<string, IReadOnlyList<string>> _reverseVocabulary;
-
-    public LessonRunner(IWebDriver driver, AppConfig config, IReadOnlyDictionary<string, IReadOnlyList<string>> vocabulary)
-        : this(new PageAgent(driver, config), vocabulary)
-    {
-    }
 
     public LessonRunner(PageAgent page, IReadOnlyDictionary<string, IReadOnlyList<string>> vocabulary)
     {
@@ -60,11 +38,7 @@ internal sealed class LessonRunner
         OpenMainPage();
 
         var props = StartLesson();
-        if (!RunLessonViaAnswerEndpoint(lessonNumber, props))
-        {
-            Console.WriteLine("Falling back to driving the lesson through the page itself.");
-            RunLessonInPage(lessonNumber);
-        }
+        PlayLesson(lessonNumber, props.LessonId, props.Step!);
     }
 
     // ---- getting into a lesson --------------------------------------------
@@ -94,8 +68,7 @@ internal sealed class LessonRunner
         var props = _page.ReadProps<StudentProps>();
         if (props?.Dashboard?.LessonLimitReached == true || props?.Wordsets?.LessonLimitReached == true)
         {
-            throw new LessonLimitReachedException(
-                "Lingos reported that today's lesson limit has been reached for this account. The bot stopped cleanly.");
+            throw new LessonLimitReachedException();
         }
     }
 
@@ -144,8 +117,7 @@ internal sealed class LessonRunner
 
         if (string.Equals(props.Reason, ReasonLimitExceeded, StringComparison.Ordinal))
         {
-            throw new LessonLimitReachedException(
-                "Lingos reported that today's lesson limit has been reached for this account. The bot stopped cleanly.");
+            throw new LessonLimitReachedException();
         }
 
         if (!string.IsNullOrWhiteSpace(props.Reason))
@@ -166,21 +138,15 @@ internal sealed class LessonRunner
         _ => "a reason the bot does not know yet"
     };
 
-    // ---- fast path: the site's own answer endpoint ------------------------
+    // ---- playing the lesson -----------------------------------------------
 
     /// <summary>
     /// Plays the lesson through <c>POST /learning/answer/{lessonId}</c>, which is what the page's
-    /// own script does. Returns false if the lesson has to be finished through the page instead.
+    /// own script does. Throws with the reason when Lingos answers with something unexpected.
     /// </summary>
-    private bool RunLessonViaAnswerEndpoint(int lessonNumber, LearningProps props)
+    private void PlayLesson(int lessonNumber, long lessonId, LearningStep step)
     {
-        if (!string.Equals(props.Status, StatusOk, StringComparison.Ordinal) || props.Step is null)
-        {
-            return false;
-        }
-
-        var answerUrl = AnswerUrl(props.LessonId);
-        var step = props.Step;
+        var answerUrl = AnswerUrl(lessonId);
 
         var attempts = 0;
         var newWordCards = 0;
@@ -194,14 +160,14 @@ internal sealed class LessonRunner
             {
                 case StateFinished:
                     Console.WriteLine($"Lesson {lessonNumber} completed after {attempts} prompts.");
-                    return true;
+                    return;
 
                 case StateChangeWordset:
                 {
                     if (string.IsNullOrWhiteSpace(step.ContinueUrl))
                     {
-                        Console.WriteLine("Lingos asked to move on to another wordset but gave no address to continue at.");
-                        return false;
+                        throw new InvalidOperationException(
+                            "Lingos asked to move on to another wordset but gave no address to continue at.");
                     }
 
                     Console.WriteLine("Lingos asked to carry the lesson on into the next wordset. Continuing...");
@@ -211,8 +177,7 @@ internal sealed class LessonRunner
                     ThrowIfLessonBlocked(continued);
                     if (!string.Equals(continued.Status, StatusOk, StringComparison.Ordinal) || continued.Step is null)
                     {
-                        Console.WriteLine($"The next wordset reported status '{continued.Status}' but no exercise.");
-                        return false;
+                        throw new InvalidOperationException($"The next wordset reported status '{continued.Status}' but no exercise.");
                     }
 
                     answerUrl = AnswerUrl(continued.LessonId);
@@ -229,17 +194,12 @@ internal sealed class LessonRunner
                     break;
 
                 default:
-                    Console.WriteLine($"Lingos returned an unfamiliar lesson step ('{step.State}'), so it has probably "
-                        + "changed how lessons work.");
-                    return false;
+                    throw new InvalidOperationException(
+                        $"Lingos returned an unfamiliar lesson step ('{step.State}'), so it has probably changed how lessons work.");
             }
 
-            var exercise = step.Exercise;
-            if (exercise is null)
-            {
-                Console.WriteLine("Lingos returned an exercise step without the exercise itself.");
-                return false;
-            }
+            var exercise = step.Exercise
+                ?? throw new InvalidOperationException("Lingos returned an exercise step without the exercise itself.");
 
             if (exercise.Identifier != currentIdentifier)
             {
@@ -256,13 +216,11 @@ internal sealed class LessonRunner
             var request = BuildAnswerRequest(exercise, lessonNumber, attempts, candidateIndex, out var promptText);
 
             var response = _page.PostJson<LearningAnswerResult>(answerUrl, request);
-            var result = response.Value;
-            if (result?.Step is null)
+            var result = response.Value
+                ?? throw new InvalidOperationException($"The lesson answer request did not go through: {response.Failure}");
+            if (result.Step is null)
             {
-                Console.WriteLine(result is null
-                    ? $"The lesson answer request did not go through: {response.Failure}"
-                    : "Lingos accepted the answer but did not say what comes next.");
-                return false;
+                throw new InvalidOperationException("Lingos accepted the answer but did not say what comes next.");
             }
 
             if (result.Feedback is { Result: <= 0 })
@@ -357,238 +315,6 @@ internal sealed class LessonRunner
             ? absolute.ToString()
             : new Uri(new Uri(_config.BaseUrl), urlOrPath).ToString();
 
-    // ---- fallback: drive the lesson through the page ----------------------
-
-    private void RunLessonInPage(int lessonNumber)
-    {
-        var prompts = 0;
-        while (prompts < _config.LessonPromptSafetyCap)
-        {
-            if (IsLessonFinished())
-            {
-                Console.WriteLine($"Lesson {lessonNumber} completed after {prompts} prompts.");
-                return;
-            }
-
-            var state = WaitForStepOrLessonFinished();
-            if (state.Kind == LessonStepKind.Finished)
-            {
-                Console.WriteLine($"Lesson {lessonNumber} completed after {prompts} prompts.");
-                return;
-            }
-
-            if (state.Kind == LessonStepKind.ContinueOnly)
-            {
-                ContinueInformationalStep();
-                continue;
-            }
-
-            prompts++;
-            var promptText = TextNormalizer.Normalize(state.PromptElement!.Text);
-            if (string.IsNullOrWhiteSpace(promptText))
-            {
-                throw new InvalidOperationException("The lesson prompt text was empty. Verify the lesson prompt selector in Selectors.cs.");
-            }
-
-            var candidates = ResolveCandidateAnswers(promptText);
-            if (candidates.Count == 0)
-            {
-                throw new InvalidOperationException(
-                    $"No collected translation exists for lesson prompt '{promptText}'. The bot stopped safely without guessing.");
-            }
-
-            if (TryAnswerPromptWithCandidates(promptText, candidates, lessonNumber, prompts))
-            {
-                Console.WriteLine($"Lesson {lessonNumber} completed.");
-                return;
-            }
-        }
-
-        throw new InvalidOperationException(
-            $"Lesson {lessonNumber} exceeded the safety cap of {_config.LessonPromptSafetyCap} prompts. Stopping to avoid an infinite loop.");
-    }
-
-    private bool TryAnswerPromptWithCandidates(
-        string promptText,
-        IReadOnlyList<string> candidateAnswers,
-        int lessonNumber,
-        int promptIndex)
-    {
-        for (var i = 0; i < candidateAnswers.Count; i++)
-        {
-            var answer = candidateAnswers[i];
-            Console.WriteLine(candidateAnswers.Count > 1 || i > 0
-                ? $"[Lesson {lessonNumber} · word {promptIndex}] {promptText} -> {answer}  (option {i + 1}/{candidateAnswers.Count})"
-                : $"[Lesson {lessonNumber} · word {promptIndex}] {promptText} -> {answer}");
-
-            var outcome = SubmitAnswerInPage(answer);
-            if (outcome == LessonAnswerOutcome.Accepted)
-            {
-                return ContinueAfterAnswer(promptText);
-            }
-
-            if (outcome == LessonAnswerOutcome.Finished)
-            {
-                return true;
-            }
-
-            if (i == candidateAnswers.Count - 1)
-            {
-                throw new InvalidOperationException($"All {candidateAnswers.Count} stored answers were rejected for lesson prompt '{promptText}'.");
-            }
-
-            Console.WriteLine($"Answer '{answer}' was rejected for '{promptText}'. Trying the next stored translation for this exact prompt only.");
-        }
-
-        return false;
-    }
-
-    private LessonAnswerOutcome SubmitAnswerInPage(string answer)
-    {
-        var answerInput = _page.WaitUntilClickable(Selectors.LessonAnswerInput);
-        if (!TryPopulateAnswerInput(answerInput, answer))
-        {
-            _page.ScrollIntoView(answerInput);
-            answerInput.SendKeys(Keys.Control + "a");
-            answerInput.SendKeys(Keys.Delete);
-            answerInput.SendKeys(answer);
-        }
-
-        if (!TryClickContinueButton())
-        {
-            answerInput.SendKeys(Keys.Enter);
-        }
-
-        return WaitForAnswerOutcome();
-    }
-
-    /// <summary>
-    /// Sets the value through the native setter and raises the events the page's framework
-    /// listens for, so a controlled input actually registers the text.
-    /// </summary>
-    private bool TryPopulateAnswerInput(IWebElement answerInput, string answer)
-    {
-        try
-        {
-            return _page.ExecuteScript(PopulateAnswerScript, answerInput, answer) is true;
-        }
-        catch (WebDriverException)
-        {
-            return false;
-        }
-    }
-
-    private bool TryClickContinueButton()
-    {
-        try
-        {
-            if (!_page.TryFindVisible(Selectors.LessonContinueButton, out var button) || button is not { Enabled: true })
-            {
-                return false;
-            }
-
-            _page.Click(button);
-            return true;
-        }
-        catch (WebDriverException)
-        {
-            return false;
-        }
-    }
-
-    private LessonAnswerOutcome WaitForAnswerOutcome()
-    {
-        var correctBy = Selectors.LessonFeedbackMarker.ToBy();
-        var incorrectBy = Selectors.LessonIncorrectAnswerMarker.ToBy();
-
-        var outcome = _page.Wait().Until<LessonAnswerOutcome?>(driver =>
-        {
-            if (IsLessonFinished())
-            {
-                return LessonAnswerOutcome.Finished;
-            }
-
-            if (_page.TryFindVisible(incorrectBy, out _))
-            {
-                return LessonAnswerOutcome.Rejected;
-            }
-
-            return _page.TryFindVisible(correctBy, out _) ? LessonAnswerOutcome.Accepted : null;
-        });
-
-        return outcome ?? throw new WebDriverTimeoutException("Timed out waiting for the lesson to accept or reject the submitted answer.");
-    }
-
-    private bool IsLessonFinished()
-        => !_page.UrlContains("/learning/") || _page.TryFindVisible(Selectors.LessonFinishedMarker, out _);
-
-    private bool ContinueAfterAnswer(string previousPromptText)
-    {
-        if (IsLessonFinished())
-        {
-            return true;
-        }
-
-        _page.Click(_page.WaitUntilClickable(Selectors.LessonContinueButton));
-        _page.Wait().Until(_ =>
-        {
-            if (IsLessonFinished())
-            {
-                return true;
-            }
-
-            var state = ReadCurrentLessonStep();
-            return state.Kind == LessonStepKind.Prompt
-                && state.PromptElement is not null
-                && !string.Equals(TextNormalizer.Normalize(state.PromptElement.Text), previousPromptText, StringComparison.OrdinalIgnoreCase);
-        });
-
-        return IsLessonFinished();
-    }
-
-    private void ContinueInformationalStep()
-    {
-        if (IsLessonFinished())
-        {
-            return;
-        }
-
-        _page.Click(_page.WaitUntilClickable(Selectors.LessonContinueButton));
-        _page.Wait().Until(_ => IsLessonFinished() || ReadCurrentLessonStep().Kind != LessonStepKind.ContinueOnly);
-    }
-
-    private LessonStepState WaitForStepOrLessonFinished()
-    {
-        var state = _page.Wait().Until(_ =>
-        {
-            var current = ReadCurrentLessonStep();
-            return current.Kind != LessonStepKind.Waiting ? current : null;
-        });
-
-        return state ?? new LessonStepState(LessonStepKind.Finished, null);
-    }
-
-    private LessonStepState ReadCurrentLessonStep()
-    {
-        if (IsLessonFinished())
-        {
-            return new LessonStepState(LessonStepKind.Finished, null);
-        }
-
-        var hasPrompt = _page.TryFindVisible(Selectors.LessonPrompt, out var prompt) && prompt is not null;
-        var hasInput = _page.TryFindVisible(Selectors.LessonAnswerInput, out _);
-        var hasContinue = _page.TryFindVisible(Selectors.LessonContinueButton, out _);
-
-        if (hasPrompt && hasInput)
-        {
-            return new LessonStepState(LessonStepKind.Prompt, prompt);
-        }
-
-        return hasContinue && !hasInput
-            ? new LessonStepState(LessonStepKind.ContinueOnly, null)
-            : new LessonStepState(LessonStepKind.Waiting, null);
-    }
-
     // ---- vocabulary lookup ------------------------------------------------
 
     private IReadOnlyList<string> ResolveCandidateAnswers(string prompt)
@@ -647,28 +373,10 @@ internal sealed class LessonRunner
     }
 }
 
-internal enum LessonAnswerOutcome
-{
-    Accepted,
-    Rejected,
-    Finished
-}
-
-internal enum LessonStepKind
-{
-    Waiting,
-    Prompt,
-    ContinueOnly,
-    Blocked,
-    Finished
-}
-
-internal sealed record LessonStepState(LessonStepKind Kind, IWebElement? PromptElement);
-
 internal sealed class LessonLimitReachedException : Exception
 {
-    public LessonLimitReachedException(string message)
-        : base(message)
+    public LessonLimitReachedException()
+        : base("Lingos reported that today's lesson limit has been reached for this account. The bot stopped cleanly.")
     {
     }
 }
