@@ -1,6 +1,6 @@
 # LingosBot
 
-A Windows desktop bot that automates lessons on [lingos.pl](https://lingos.pl) using Selenium and Google Chrome. It logs in, learns your vocabulary from your *Zestawy*, and auto-completes lessons. Before each lesson it automatically picks or continues a **Wyzwania** (challenge), preferring the one worth the most points.
+A desktop bot that automates lessons on [lingos.pl](https://lingos.pl) using Selenium and Google Chrome. It logs in, learns your vocabulary from your *Zestawy*, and auto-completes lessons. Before each lesson it automatically picks or continues a **Wyzwania** (challenge), preferring the one worth the most points.
 
 This repository contains the **source code** — you build the program yourself with one command (see below).
 
