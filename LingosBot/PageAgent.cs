@@ -75,6 +75,19 @@ internal sealed class PageAgent
 
     public void GoTo(string url) => _driver.Navigate().GoToUrl(url);
 
+    /// <summary>True when lingos.pl serves its "Under maintenance" page instead of the site.</summary>
+    public bool IsMaintenancePage()
+    {
+        try
+        {
+            return _driver.Title?.Contains("maintenance", StringComparison.OrdinalIgnoreCase) == true;
+        }
+        catch (WebDriverException)
+        {
+            return false;
+        }
+    }
+
     // ---- page props -------------------------------------------------------
 
     /// <summary>Reads the JSON the server rendered into <c>#app[data-props]</c> for the open page.</summary>
@@ -104,6 +117,11 @@ internal sealed class PageAgent
     /// </summary>
     public string DescribePageDataProblem<T>() where T : class
     {
+        if (IsMaintenancePage())
+        {
+            return MaintenanceProblem;
+        }
+
         if (IsLoginUrl(Url))
         {
             return "Lingos showed its login page instead, so the session has expired or the login did not go through.";
@@ -246,6 +264,7 @@ internal sealed class PageAgent
         405 => "this endpoint no longer accepts this kind of request",
         409 => "the lesson state is out of date",
         429 => "too many requests; Lingos is rate limiting",
+        503 => "Lingos is down, probably for maintenance; try again later",
         >= 500 => "Lingos had a server error; try again later",
         _ => "unexpected response"
     };
@@ -263,6 +282,8 @@ internal sealed class PageAgent
         text = TextNormalizer.Normalize(text);
         return text.Length <= 200 ? text : text[..200] + "...";
     }
+
+    private const string MaintenanceProblem = "lingos.pl is showing its 'Under maintenance' page, so the site is down for now; try again later.";
 
     private static bool IsLoginUrl(string? url) => url?.Contains("/h/login", StringComparison.OrdinalIgnoreCase) == true;
 
@@ -382,6 +403,11 @@ internal sealed class PageAgent
     /// <summary>Says whether a selector that timed out is missing, hidden or disabled on the open page.</summary>
     private string DescribeElementProblem(By by, bool requireEnabled)
     {
+        if (IsMaintenancePage())
+        {
+            return MaintenanceProblem;
+        }
+
         if (IsLoginUrl(Url))
         {
             return "Lingos showed its login page instead, so the session has expired or the login did not go through.";

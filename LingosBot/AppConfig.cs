@@ -42,6 +42,12 @@ internal sealed class AppConfig
 
     public TimeSpan PollingInterval { get; } = TimeSpan.FromMilliseconds(25);
 
+    /// <summary>How often to look again while lingos.pl shows its "Under maintenance" page.</summary>
+    public TimeSpan MaintenanceRetryInterval { get; } = TimeSpan.FromMinutes(1);
+
+    /// <summary>How long to wait for maintenance to end before giving up on the account.</summary>
+    public TimeSpan MaintenanceWaitLimit { get; } = TimeSpan.FromMinutes(30);
+
     public int MinLessonCount { get; } = 1;
 
     public int LessonsPerClass { get; } = 5;
