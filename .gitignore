@@ -22,3 +22,6 @@ diagnostics/
 
 # Published output from the VSCodium task
 publish-output/
+
+# Claude Code session worktrees
+.claude/
